@@ -3,11 +3,11 @@
 makes its two files hold as many as are asked for, the tiles smaller the more there are.
 
 Usage:
-  css_layout.py make --tiles N --out <folder> [--romfs-cfg <romfs.cfg>] [--layout <layout.arc>]
+  css_layout.py make --tiles N --out <folder> [--romfs-cfg <romfs.cfg>] [--layout <layout.arc>] [--fill]
       writes <folder>/ui/layout/menu/chara_select/chara_select/layout.arc and
       <folder>/ui/param/menu/chara_icon_arrangement.prc (a mod's folder: tools/mods.py does it by itself
       when the turned-on mods add more fighters than the screen holds)
-  css_layout.py plan N        the rows and the tile size the screen gets for N fighters
+  css_layout.py plan N [--fill]   the rows and the tile size the screen gets for N fighters
 
 How the game lays the screen out (main 13.0.5 0x71019eb840, plan/phases/N2_real_slots.md 3.2): for N
 tiles it reads row N of a table in chara_icon_arrangement.prc (normal_layout_param, and
@@ -24,6 +24,13 @@ for N up to 91 and 91 tiles in its layout. Here:
     copy of its material (the game colours each tile's own).
 The game's own code only walks tiles 0..90 when it sets the tiles up and hides the ones not used:
 runtime/hle_select_screen.c does that for the others.
+
+--fill (a draft, off unless asked for): the normal screen's grids get a tile size each that shares the
+screen's width and height out in whole pixels (14 x 8: 133 x 71, where the 0.97 steps give 124 x 70), so
+width and height are scaled apart. Made-up files only so far: not tried on the game's animation (does
+the picture stretch?) nor in the game. The tournament's screen keeps the 0.97 steps. The size numbers
+no longer say how small a tile is (they count down from 99), so this needs a runtime that writes no
+scale of its own on tiles 91.. (runtime/hle_select_screen.c did, from the size number).
 
 Nothing of the game is in this file: the files are made from the player's own copies of them."""
 import argparse
@@ -44,6 +51,7 @@ GAME_TILES = 91
 BASE_SIZE, FIRST_SIZE, SIZES, FACTOR = 7, 9, 91, 0.97   # sizes 09..99: 0.97 .. 0.97**91 (0.06) of size 07
 CELL_W, CELL_H = 144.0, 82.0                    # size 07's tile ("hit"): 13 x 7 of them fill set_chr_area
 NORMAL_COLS, NORMAL_ROWS = 13, 7                # what fits at size 07 (1868 x 572)
+AREA_W, AREA_H = NORMAL_COLS * CELL_W, NORMAL_ROWS * CELL_H   # (--fill: 1872 x 574 to share out)
 COMPE_W = 7 * 138.0                             # the tournament screen: 13 rows of 7 at size 08 (138 x 82)
 MAX_ROWS = 13                                   # the game keeps 13 row counts (object + 0x1d4)
 MAX_TILES = 1000                                # (they fit at the smallest size, the tournament screen too; chara_num a u16 past 255)
@@ -200,9 +208,12 @@ def add_tiles(lyt, tiles):
 
 
 # ---- BFLAN (the tile sizes) ----------------------------------------------------------------------
-def scaled_size(anim, old, new, factor):
+def scaled_size(anim, old, new, factor, factor_y=None):
     """The size animation `old` (window_size_07) as `new`: every pane's place times `factor`, and its
-    scale when the animation sets one, else its size."""
+    scale when the animation sets one, else its size; what goes up and down (targets 1, 7, 9) times
+    `factor_y` when one is given (--fill)."""
+    if factor_y is None:
+        factor_y = factor
     a = bytearray(anim.replace(old.encode() + b"\0", new.encode() + b"\0"))
     if a[:4] != b"FLAN":
         raise Error("not an animation (FLAN)")
@@ -230,7 +241,8 @@ def scaled_size(anim, old, new, factor):
                     keys, at = struct.unpack_from("<H", a, k + 4)[0], k + struct.unpack_from("<I", a, k + 8)[0]
                     for j in range(keys):
                         f, v, s = struct.unpack_from("<3f", a, at + 12 * j)
-                        struct.pack_into("<3f", a, at + 12 * j, f, v * factor, s * factor)
+                        by = factor_y if target in (1, 7, 9) else factor
+                        struct.pack_into("<3f", a, at + 12 * j, f, v * by, s * by)
         o += size
     return bytes(a)
 
@@ -278,8 +290,28 @@ KEYS = {name: prc.hash40(name) for name in
         ["chara_num", "icon_size", "margin_x", "margin_y", "offset"] + [f"row{r:02d}_num" for r in range(MAX_ROWS)]}
 
 
-def add_rows(data, tiles):
+def fill_tile(cols, rows):
+    """--fill: the whole-pixel tile (width, height) of a grid of `cols` x `rows` tiles."""
+    return int(AREA_W // cols), int(AREA_H // rows)
+
+
+def fill_sizes(tiles):
+    """--fill: {(tiles in a row, rows): size} for the normal screen's grids of 92..tiles tiles, a size
+    each from the last one (99) down; the tournament's rows keep the 0.97 steps, which go up from 09."""
+    sizes, taken = {}, FIRST_SIZE - 1
+    for n in range(GAME_TILES + 1, tiles + 1):
+        counts, _size = plan(n)
+        sizes.setdefault((counts[0], len(counts)), FIRST_SIZE + SIZES - 1 - len(sizes))
+        taken = max(taken, plan(n, True)[1])
+    if sizes and min(sizes.values()) <= taken:
+        raise Error(f"--fill: {tiles} tiles make {len(sizes)} grids and the tournament screen's sizes go up to "
+                    f"{taken}: {FIRST_SIZE + SIZES - 1 - taken} sizes are left")
+    return sizes
+
+
+def add_rows(data, tiles, fill=False):
     """chara_icon_arrangement.prc with rows for 1..tiles in both tables (the game's kept as they are)."""
+    sizes = fill_sizes(tiles) if fill else {}
     kind, root = prc.read(data)
     out = prc.Struct()
     for key, (lkind, rows) in root:
@@ -292,6 +324,8 @@ def add_rows(data, tiles):
         fields = {k: t for k, (t, _v) in template}
         for n in range(len(rows) + 1, tiles + 1):
             counts, size = plan(n, compe)
+            if fill and not compe:
+                size = sizes[(counts[0], len(counts))]
             value = {KEYS["chara_num"]: n, KEYS["icon_size"]: size, KEYS["margin_x"]: 0, KEYS["margin_y"]: 0,
                      KEYS["offset"]: 1}
             for r in range(MAX_ROWS):
@@ -308,7 +342,7 @@ def add_rows(data, tiles):
 
 
 # ---- the two files -----------------------------------------------------------------------------
-def make_layout(arc, tiles):
+def make_layout(arc, tiles, fill=False):
     files = sarc_read(arc)
     by = {name: i for i, (name, _b, _a) in enumerate(files)}
     for need in (MAIN, INFO, SIZE_ANIM.format(BASE_SIZE)):
@@ -317,12 +351,16 @@ def make_layout(arc, tiles):
     name, body, align = files[by[MAIN]]
     files[by[MAIN]] = (name, add_tiles(body, tiles)[0], align)
     base = files[by[SIZE_ANIM.format(BASE_SIZE)]][1]
+    fills = {size: fill_tile(*grid) for grid, size in fill_sizes(tiles).items()} if fill else {}
     names = []
     for size in range(FIRST_SIZE, FIRST_SIZE + SIZES):
         anim = SIZE_ANIM.format(size)
         tag = f"window_size_{size:02d}"
         names.append(tag)
-        body = scaled_size(base, f"window_size_{BASE_SIZE:02d}", tag, size_factor(size))
+        if size in fills:
+            body = scaled_size(base, f"window_size_{BASE_SIZE:02d}", tag, fills[size][0] / CELL_W, fills[size][1] / CELL_H)
+        else:
+            body = scaled_size(base, f"window_size_{BASE_SIZE:02d}", tag, size_factor(size))
         if anim in by:
             files[by[anim]] = (anim, body, files[by[anim]][2])
         else:
@@ -332,15 +370,15 @@ def make_layout(arc, tiles):
     return sarc_write(files)
 
 
-def make(tiles, layout, arrangement):
+def make(tiles, layout, arrangement, fill=False):
     """(layout.arc, chara_icon_arrangement.prc) for `tiles` tiles, from the game's (or a mod's) two."""
     if not GAME_TILES < tiles <= MAX_TILES:
         raise Error(f"{tiles} tiles: {GAME_TILES + 1} to {MAX_TILES}")
-    return make_layout(layout, tiles), add_rows(arrangement, tiles)
+    return make_layout(layout, tiles, fill), add_rows(arrangement, tiles, fill)
 
 
-def write_mod(folder, tiles, layout, arrangement):
-    lay, arr = make(tiles, layout, arrangement)
+def write_mod(folder, tiles, layout, arrangement, fill=False):
+    lay, arr = make(tiles, layout, arrangement, fill)
     for path, data in ((LAYOUT, lay), (ARRANGEMENT, arr)):
         out = os.path.join(folder, *path.split("/"))
         os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -371,19 +409,24 @@ def main():
     m.add_argument("--romfs-cfg", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                                        "dump", "modules", "romfs.cfg"))
     m.add_argument("--layout", help="a layout.arc to start from (a mod's), instead of the game's")
+    m.add_argument("--fill", action="store_true", help="a draft: a tile size per grid that fills the screen")
     p = sub.add_parser("plan")
     p.add_argument("n", type=int)
+    p.add_argument("--fill", action="store_true")
     args = ap.parse_args()
     if args.cmd == "plan":
         for compe in (False, True):
             counts, size = plan(args.n, compe)
             print(f"{'tournament' if compe else 'normal'}: rows {counts}, size {size} ({size_factor(size):.2f} of the 91-tile size)")
+            if args.fill and not compe:
+                w, h = fill_tile(counts[0], len(counts))
+                print(f"normal with --fill: a {w} x {h} tile (now {CELL_W * size_factor(size):.0f} x {CELL_H * size_factor(size):.0f})")
         return
     layout, arrangement = game_files(args.romfs_cfg)
     if args.layout:
         with open(args.layout, "rb") as f:
             layout = f.read()
-    for path in write_mod(args.out, args.tiles, layout, arrangement):
+    for path in write_mod(args.out, args.tiles, layout, arrangement, args.fill):
         print(os.path.join(args.out, *path.split("/")))
 
 

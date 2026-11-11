@@ -78,7 +78,8 @@ def content(name, tags):
 
 def flan(name):
     conts = [content('hit', [tag(b'FLPA', [target(8, 2, 144.0), target(9, 2, 82.0)])]),
-             content('hd', [tag(b'FLPA', [target(0, 2, -52.0), target(6, 2, 0.5), target(8, 2, 20.0)]),
+             content('hd', [tag(b'FLPA', [target(0, 2, -52.0), target(6, 2, 0.5), target(8, 2, 20.0),
+                                         target(1, 2, 30.0), target(7, 2, 0.75), target(9, 2, 10.0)]),
                             tag(b'FLVI', [])])]
     offs, pos = [], 0x14 + 4 * len(conts)
     for c in conts:
@@ -254,6 +255,59 @@ class Table(unittest.TestCase):
         self.assertEqual(len(rows_of(arr, 'normal_layout_param')), 120)
         with self.assertRaises(css_layout.Error):
             css_layout.make(91, layout_arc(), arrangement(91))
+
+
+class Fill(unittest.TestCase):
+    """fill (a draft, off unless asked for): one tile size per grid, the screen's width and height
+    (13 x 144 = 1872 by 7 x 82 = 574) shared out in whole pixels, in place of the 0.97 steps."""
+
+    def test_tile_of_each_grid(self):
+        by_hand = {(14, 7): (133, 82), (13, 8): (144, 71), (14, 8): (133, 71), (15, 8): (124, 71), (16, 8): (117, 71),
+                   (15, 9): (124, 63), (16, 9): (117, 63), (17, 9): (110, 63), (18, 9): (104, 63)}
+        for (cols, rows), tile in by_hand.items():
+            self.assertEqual(css_layout.fill_tile(cols, rows), tile, (cols, rows))
+
+    def test_scaled_each_way(self):
+        base = read_flan(flan('window_size_07'))
+        got = read_flan(css_layout.scaled_size(flan('window_size_07'), 'window_size_07', 'window_size_99', 0.5, 0.25))
+        for key, factor in {('hit', 8): 0.5, ('hit', 9): 0.25,     # no scale: the size, width and height apart
+                            ('hd', 0): 0.5, ('hd', 1): 0.25,       # the place
+                            ('hd', 6): 0.5, ('hd', 7): 0.25,       # a scale: the scale...
+                            ('hd', 8): 1.0, ('hd', 9): 1.0}.items():   # ...and not the size too
+            self.assertAlmostEqual(got[key], base[key] * factor, msg=key)
+
+    def test_rows(self):
+        plain = css_layout.add_rows(arrangement(91), 130)
+        out = css_layout.add_rows(arrangement(91), 130, fill=True)
+        rows = rows_of(out, 'normal_layout_param')
+        self.assertEqual(rows[:91], rows_of(arrangement(91), 'normal_layout_param'))   # (the game's kept)
+        self.assertEqual([r[2] for r in rows], [r[2] for r in rows_of(plain, 'normal_layout_param')])   # the same grids
+        size = {n: s for n, s, _counts in rows}
+        # 14 x 7, 13 x 8, 14 x 8, 15 x 8, 16 x 8, 15 x 9: a size each, none of them shared
+        grids = [range(92, 99), range(99, 105), range(105, 113), range(113, 121), range(121, 129), range(129, 131)]
+        picked = [{size[n] for n in grid} for grid in grids]
+        self.assertEqual([len(p) for p in picked], [1] * 6)
+        self.assertEqual(len(set().union(*picked)), 6)
+        self.assertTrue(all(css_layout.FIRST_SIZE <= s < css_layout.FIRST_SIZE + css_layout.SIZES for p in picked for s in p))
+        self.assertEqual(rows_of(out, 'compe_layout_param'), rows_of(plain, 'compe_layout_param'))   # (the tournament's: as without)
+
+    def test_make(self):
+        lay, arr = css_layout.make(130, layout_arc(), arrangement(91), fill=True)
+        files = {n: b for n, b, _a in css_layout.sarc_read(lay)}
+        size = {n: s for n, s, _counts in rows_of(arr, 'normal_layout_param')}
+        for n, (w, h) in {95: (133, 82), 100: (144, 71), 108: (133, 71), 130: (124, 63)}.items():
+            hit = read_flan(files[css_layout.SIZE_ANIM.format(size[n])])
+            self.assertAlmostEqual(hit[('hit', 8)], w, places=3, msg=n)
+            self.assertAlmostEqual(hit[('hit', 9)], h, places=3, msg=n)
+        compe = {n: s for n, s, _counts in rows_of(arr, 'compe_layout_param')}[130]   # a tournament size: still a 0.97 step
+        hit = read_flan(files[css_layout.SIZE_ANIM.format(compe)])
+        self.assertAlmostEqual(hit[('hit', 8)], 144.0 * css_layout.size_factor(compe), places=3)
+        self.assertAlmostEqual(hit[('hit', 9)], 82.0 * css_layout.size_factor(compe), places=3)
+
+    def test_too_many_grids_for_the_sizes_left(self):
+        css_layout.make(300, layout_arc(), arrangement(91), fill=True)
+        with self.assertRaisesRegex(css_layout.Error, 'fill'):
+            css_layout.make(500, layout_arc(), arrangement(91), fill=True)
 
 
 class FakeTable:
