@@ -1598,18 +1598,25 @@ static Redirect *redirect_in(u64 rec) {
 #define UI_PATH 0x3238a70
 static u64 ui_path_original;
 
-static void ui_path(Cpu *c) {
-    u64 h = c->x[0] & 0xFFFFFFFFFFull;
-    int color = (int)c->x[1];
-    bench_note("portrait path asked");
+/* (two characters on one fighter's costumes, c08.. and c24..: their windows overlap, so the one whose
+ * costumes start nearest below the costume asked - not the first added) */
+static Redirect *redirect_for_path(u64 h, int color) {
+    Redirect *fit = NULL;
     for (u32 i = 0; i < redirect_n; i++) {
         Redirect *r = &redirects[i];
         if (color < r->start || color >= r->start + 64) continue;
-        if (h == r->ui_chara || (r->base && h == r->base)) {
-            c->x[0] = (c->x[0] & ~0xFFFFFFFFFFull) | r->ui_chara;
-            c->x[1] = (u64)(color - r->start);
-            break;
-        }
+        if ((h == r->ui_chara || (r->base && h == r->base)) && (!fit || r->start > fit->start)) fit = r;
+    }
+    return fit;
+}
+
+static void ui_path(Cpu *c) {
+    int color = (int)c->x[1];
+    bench_note("portrait path asked");
+    Redirect *r = redirect_for_path(c->x[0] & 0xFFFFFFFFFFull, color);
+    if (r) {
+        c->x[0] = (c->x[0] & ~0xFFFFFFFFFFull) | r->ui_chara;
+        c->x[1] = (u64)(color - r->start);
     }
     rt_call(c, ui_path_original);
 }
