@@ -224,7 +224,7 @@ GameBanana's Skyline category:
 | Smashline 2 `libsmashline_plugin.nro` | 1.6.8 (2026-09-16) | github.com/HDR-Development/smashline | none declared | inline hooks in `lua2cpp_*` found when they load (nn::ro hooks); native version in the runtime today |
 | lib_paramconfig `libparam_config.nro` | 6.5 | github.com/CSharpM7/lib_paramconfig | none declared | hooks on param getters; ARCropolis `is_mod_enabled` |
 | nro_hook `libnro_hook.nro` | 0.4.0 | github.com/ultimate-research/nro-hook-plugin | none declared | hooks nn::ro::LoadModule (the runtime tells plugins about loaded modules itself) |
-| The CSK Collection `libthe_csk_collection.nro` | 5.0.6 | gamebanana.com/mods/499008 | CC (no re-uploads) | ARCropolis file callbacks (rewrites ui_chara_db etc. as they load), inline hooks, code patches |
+| The CSK Collection `libthe_csk_collection.nro` | 6.0.1 | gamebanana.com/mods/499008 | CC (no re-uploads) | ARCropolis file callbacks (rewrites ui_chara_db etc. as they load), inline hooks, code patches |
 | One Slot Effects `libone_slot_eff.nro` | 13.0.5 build | gamebanana.com/mods/549058 | CC | ~30 inline hooks + 3 code patches at fixed 13.0.5 addresses |
 | Smashline 2 / One Slot Effects compatibility edit | 1.4.1 | gamebanana.com/mods/532968 | CC | (an older Smashline build that worked with older OSE; not needed with the 13.0.5 OSE) |
 | One Slot Victory Theme (SL2) | - | gamebanana.com/mods/38834 | CC | nn::ro LookupSymbol + one hook |
