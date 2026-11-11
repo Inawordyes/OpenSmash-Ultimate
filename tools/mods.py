@@ -2205,13 +2205,10 @@ UI_CHARA_ID = prc.hash40("ui_chara_id")
 CHARA_DB = ("ui", "param", "database", "ui_chara_db.prcxml")
 
 
-def prcxml_redirects(tree, on, log):
-    """The characters the turned-on mods add with their ui_chara_db.prcxml alone - no plugin, so no
-    CSK Collection call - on another fighter's extra costumes (Popple: Mario's c24-c31, its
-    color_start_index 24), into dump/skyline/prcxml_redirects.txt, a line each: the ui_chara hash40
-    and its first costume. runtime/hle_skyline.c adds them to the characters it redirects, as the
-    CSK Collection does on the console; without it such a character played its fighter's c00."""
-    found = {}
+def chara_db_patch_rows(tree, on, log):
+    """The rows in the turned-on mods' ui_chara_db.prcxml files, each as {field's hash40: (kind, value)};
+    a file that can't be read is said and left out."""
+    rows = []
     for name in on:
         for root in find_roots(os.path.join(tree.mods, name)) or [os.path.join(tree.mods, name)]:
             path = os.path.join(root, *CHARA_DB)
@@ -2228,13 +2225,21 @@ def prcxml_redirects(tree, on, log):
             for _key, (list_kind, entries) in db:
                 if list_kind != prc.LIST:
                     continue
-                for entry_kind, entry in entries:
-                    if entry_kind != prc.STRUCT:
-                        continue
-                    fields = dict(entry)
-                    chara, start = fields.get(UI_CHARA_ID, (None, 0))[1], fields.get(COLOR_START, (None, 0))[1]
-                    if chara and start:
-                        found[chara] = start
+                rows += [dict(entry) for entry_kind, entry in entries if entry_kind == prc.STRUCT]
+    return rows
+
+
+def prcxml_redirects(tree, on, log):
+    """The characters the turned-on mods add with their ui_chara_db.prcxml alone - no plugin, so no
+    CSK Collection call - on another fighter's extra costumes (Popple: Mario's c24-c31, its
+    color_start_index 24), into dump/skyline/prcxml_redirects.txt, a line each: the ui_chara hash40
+    and its first costume. runtime/hle_skyline.c adds them to the characters it redirects, as the
+    CSK Collection does on the console; without it such a character played its fighter's c00."""
+    found = {}
+    for fields in chara_db_patch_rows(tree, on, log):
+        chara, start = fields.get(UI_CHARA_ID, (None, 0))[1], fields.get(COLOR_START, (None, 0))[1]
+        if chara and start:
+            found[chara] = start
     path = os.path.join(tree.root, "dump", "skyline", "prcxml_redirects.txt")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="\n") as f:
@@ -2288,13 +2293,23 @@ def new_characters(tree, names):
     return new, arranged
 
 
-def select_screen_count(tree, on):
+def select_screen_count(tree, on, table):
     """(how many fighters the turned-on mods add to the select screen, whether one of them brings its
     own arrangement): the entries Skyline plugins add (dump/skyline/csk.json; before the game's first
-    start with them, one a plugin) and OpenSmash's own new fighters (config.json's new-fighters)."""
+    start with them, one a plugin), the characters the mods' ui_chara_db.prcxml files add (a row
+    whose ui_chara_id the game's ui_chara_db has not: Popple's, with no plugin) and OpenSmash's own
+    new fighters (config.json's new-fighters)."""
+    def ids(rows):
+        return {fields[UI_CHARA_ID][1] for fields in rows if UI_CHARA_ID in fields}
+
     new, arranged = new_characters(tree, on)
     entries = [e for e in csk.load(tree.root) if e.get("kind") == "ui_chara_db"]
-    return (len(entries) if entries else len(new)) + len(mod_config(tree, on)["new-fighters"]), arranged
+    alone = on if entries else [name for name in on if name not in new]   # (a plugin's mod is one character till csk.json lists them)
+    patched = ids(chara_db_patch_rows(tree, alone, lambda _said: None)) - {int(e["ui_chara_id"], 16) for e in entries}
+    if patched:   # (less the game's own characters, whose rows a mod only changes)
+        game = dict(prc.read(table.original(*table.file_targets(csk.CHARA_DB)[0]))[1])[csk.DB_ROOT][1]
+        patched -= ids(dict(row) for _kind, row in game)
+    return (len(entries) if entries else len(new)) + len(patched) + len(mod_config(tree, on)["new-fighters"]), arranged
 
 
 def select_screen(tree, on, table, folder, log):
@@ -2306,7 +2321,7 @@ def select_screen(tree, on, table, folder, log):
     leaves out. Nothing is made when a mod brings its own arrangement (it is used as it is) or the
     game's screen has room. [(data.arc path, file)] of the files made."""
     import css_layout
-    extra, arranged = select_screen_count(tree, on)
+    extra, arranged = select_screen_count(tree, on, table)
     paths = [css_layout.LAYOUT, css_layout.ARRANGEMENT]
     if extra <= GAME_ROOM or arranged:
         if arranged and extra > GAME_ROOM:

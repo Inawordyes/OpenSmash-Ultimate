@@ -146,6 +146,12 @@ def rows_of(data, key):
     return out
 
 
+def chara_db(names):
+    """A ui_chara_db.prc with a row for each of the characters."""
+    rows = prc.List((prc.STRUCT, prc.Struct([(prc.hash40('ui_chara_id'), (prc.HASH, prc.hash40(n)))])) for n in names)
+    return prc.write((prc.STRUCT, prc.Struct([(prc.hash40('db_root'), (prc.LIST, rows))])))
+
+
 class Archive(unittest.TestCase):
     def test_round_trip(self):
         data = layout_arc()
@@ -258,7 +264,8 @@ class Table(unittest.TestCase):
 
 class FakeTable:
     def __init__(self):
-        self.files = {css_layout.LAYOUT: layout_arc(), css_layout.ARRANGEMENT: arrangement(91)}
+        self.files = {css_layout.LAYOUT: layout_arc(), css_layout.ARRANGEMENT: arrangement(91),
+                      mods.csk.CHARA_DB: chara_db(['ui_chara_mario', 'ui_chara_donkey'])}
 
     def file_targets(self, path):
         return [(path, 0)]
@@ -306,6 +313,55 @@ class SelectScreen(unittest.TestCase):
             said = []
             self.assertEqual(mods.select_screen(tree, ['new'], FakeTable(), os.path.join(tree.work, 'ss'), said.append), [])
             self.assertIn("a mod's own select screen arrangement is used", said[-1])
+
+    def patch(self, tree, mod, index, chara):
+        """A mod with a ui_chara_db.prcxml of one row, at `index`."""
+        own = os.path.join(tree.mods, mod, *mods.CHARA_DB)
+        os.makedirs(os.path.dirname(own), exist_ok=True)
+        with open(own, 'w', encoding='utf-8') as f:
+            f.write(f'<struct><list hash="db_root"><struct index="{index}">'
+                    f'<hash40 hash="ui_chara_id">{chara}</hash40></struct></list></struct>')
+
+    def test_character_of_a_prcxml_alone_counts(self):
+        # Popple: his select-screen row comes from his mod's ui_chara_db.prcxml, no plugin adds it
+        with tempfile.TemporaryDirectory() as d:
+            tree = self.tree(d, 4)   # (4 new fighters: the game's own screen still has room)
+            self.patch(tree, 'popple', 2, 'ui_chara_popple')
+            folder = os.path.join(tree.work, 'select_screen')
+            said = []
+            self.assertEqual(mods.select_screen(tree, ['new'], FakeTable(), folder, said.append), [])   # (his mod turned off)
+            made = mods.select_screen(tree, ['new', 'popple'], FakeTable(), folder, said.append)
+            self.assertEqual([p for p, _s in made], [css_layout.LAYOUT, css_layout.ARRANGEMENT])
+            self.assertIn('the select screen made for 96 tiles', said[-1])
+
+    def test_prcxml_row_of_a_character_the_game_has_does_not_count(self):
+        # a mod that changes Mario's own row (his order, his name): no tile more
+        with tempfile.TemporaryDirectory() as d:
+            tree = self.tree(d, 4)
+            self.patch(tree, 'reorder', 0, 'ui_chara_mario')
+            self.assertEqual(mods.select_screen(tree, ['new', 'reorder'], FakeTable(), os.path.join(tree.work, 'ss'), [].append), [])
+
+    def test_character_of_a_plugin_and_a_prcxml_counts_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            tree = self.tree(d, 0)
+            plugins = os.path.join(tree.root, 'dump', 'skyline', 'csk.json')
+            os.makedirs(os.path.dirname(plugins))
+            with open(plugins, 'w') as f:   # (4 characters of plugins: the game's own screen has room)
+                json.dump([{'kind': 'ui_chara_db', 'ui_chara_id': f'{prc.hash40(n):#x}'}
+                           for n in ('ui_chara_popple', 'ui_chara_a', 'ui_chara_b', 'ui_chara_c')], f)
+            self.patch(tree, 'popple', 2, 'ui_chara_popple')
+            self.assertEqual(mods.select_screen(tree, ['new', 'popple'], FakeTable(), os.path.join(tree.work, 'ss'), [].append), [])
+
+    def test_before_the_first_start_a_plugins_mod_with_a_prcxml_row_counts_once(self):
+        # no csk.json yet: each mod with a plugin is one character, its own .prcxml row is no second one
+        with tempfile.TemporaryDirectory() as d:
+            tree = self.tree(d, 0)
+            for mod in 'abcd':   # (4 of them: the game's own screen has room)
+                os.makedirs(os.path.join(tree.mods, mod))
+                with open(os.path.join(tree.mods, mod, 'plugin.nro'), 'wb') as f:
+                    f.write(b'add_chara_db_entry_info')
+            self.patch(tree, 'a', 2, 'ui_chara_a')
+            self.assertEqual(mods.select_screen(tree, ['new', *'abcd'], FakeTable(), os.path.join(tree.work, 'ss'), [].append), [])
 
 
 if __name__ == '__main__':

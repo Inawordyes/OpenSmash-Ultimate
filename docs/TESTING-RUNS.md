@@ -227,7 +227,8 @@ What was run (2026-11-03, 13.0.5, gate2 sequence, `SSBU_DETERMINISTIC=1 SSBU_FIX
 ## More fighters than the select screen holds
 
 The game's select screen has 91 tiles (13 x 7) and its own fighters fill 87. When the turned-on mods add more
-(OpenSmash's new fighters, `config.json`'s `new-fighters`; Skyline plugins' select-screen entries, `dump/skyline/csk.json`),
+(OpenSmash's new fighters, `config.json`'s `new-fighters`; Skyline plugins' select-screen entries, `dump/skyline/csk.json`;
+characters a mod adds with its `ui_chara_db.prcxml` alone, rows of a `ui_chara_id` the game has not),
 `tools/mods.py apply` makes the screen's layout and table for 91 + that many tiles ([`tools/css_layout.py`](../tools/css_layout.py),
 kept in `dump/mods/select_screen`; `python tools/css_layout.py plan <n>` shows the rows and tile size for n tiles) and
 [`runtime/hle_select_screen.c`](../runtime/hle_select_screen.c) sizes and hides the tiles past 91. A mod with its own
