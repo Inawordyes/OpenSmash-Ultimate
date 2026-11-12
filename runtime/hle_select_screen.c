@@ -14,7 +14,10 @@
  *   - tiles 91.. of the rows are left as they are: they already have the row's size (seen on a 108-tile
  *     screen, 14 x 8 at size 13, 2560 px wide, with the CSK Collection loaded: tiles 0..90 are 165 px
  *     wide; a scale of 0.97 ** (size - 8) written here on the part pane of tiles 91.. made those about
- *     143 px, the size applied twice). Which code sizes them is not traced;
+ *     143 px, the size applied twice). The game's walk above sizes them: the CSK Collection (5.0.6 and
+ *     6.0.1 write the same words) patches its three tile limits, cmp #0x5b at 0x71019edd30 to #255 and
+ *     cmp #0x5a at 0x71019f043c / 0x71019f04cc to #254 (dump/skyline/patches.txt). Without that plugin
+ *     the walk stops at tile 90 and nothing sizes tiles 91..: not tested;
  *   - the tiles past the rows' (their counts at screen + 0x1d4; Random's entry, the vector's last, is not
  *     one of them) from 91 on are hidden (the pane's +0x58 bit 0, as the game hides).
  * More fighters than the layout holds (no row in the table: the game would abort) are not given to it:
