@@ -133,7 +133,9 @@ namespace OpenSmash.Launcher
             string folder = _target;
             try
             {
-                await ProjectSetup.InstallAsync(folder, ProjectSetup.MainZipUrl, (phase, done, total) =>
+                // (the stable release's sources - the commit its manifest names - else the latest release's tag, else main: ProjectSetup)
+                string source = await ProjectSetup.ProjectZipUrlAsync(_cts.Token);
+                await ProjectSetup.InstallAsync(folder, source, (phase, done, total) =>
                 {
                     _phase = phase; _done = done; _total = total;
                 }, _cts.Token);
@@ -170,11 +172,11 @@ namespace OpenSmash.Launcher
 
         void UseExisting()
         {
-            using var dlg = new FolderBrowserDialog { Description = "The OpenSmash folder you already have (with tools\\install_windowsmash.ps1)", UseDescriptionForTitle = true };
+            using var dlg = new FolderBrowserDialog { Description = "The OpenSmash folder you already have (with tools\\install_opensmash.ps1)", UseDescriptionForTitle = true };
             if (dlg.ShowDialog(this) != DialogResult.OK) return;
             if (!ProjectSetup.IsProject(dlg.SelectedPath))
             {
-                _modal = new Prompt { Title = "NOT AN OPENSMASH FOLDER", Body = dlg.SelectedPath + " has no tools\\install_windowsmash.ps1. Choose the folder you downloaded or cloned OpenSmash into." };
+                _modal = new Prompt { Title = "NOT AN OPENSMASH FOLDER", Body = dlg.SelectedPath + " has no tools\\install_opensmash.ps1. Choose the folder you downloaded or cloned OpenSmash into." };
                 return;
             }
             Finish(dlg.SelectedPath);
@@ -340,7 +342,7 @@ namespace OpenSmash.Launcher
 
             SectionLabel(g, "OPTIONS", rx, 138 * s);
             Theme.Card(g, rx, 158 * s, rightW, 120 * s, 10 * s, s);
-            PaintOption(g, "opt:desktop", "Desktop shortcuts: OpenSmash and Play SSBU", _optDesktop, rx, 168 * s, rightW, 44 * s);
+            PaintOption(g, "opt:desktop", "Desktop shortcuts: OpenSmash-Launcher and OpenSmash-Ultimate", _optDesktop, rx, 168 * s, rightW, 44 * s);
             PaintOption(g, "opt:start", "Start menu entries (an OpenSmash folder)", _optStartMenu, rx, 212 * s, rightW, 44 * s);
 
             float ay = 574 * s;

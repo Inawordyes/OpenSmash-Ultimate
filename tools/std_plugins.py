@@ -8,7 +8,7 @@ Usage:
   std_plugins.py list  [--tree <dir>]            each plugin: version, whether it is fetched, whether it runs here
   std_plugins.py fetch [--tree <dir>] [names...]  download (the ones that run here, or the named ones) and check them
 
-They are downloaded, not shipped in WindowSmash: none of the GitHub ones declares a licence, and
+They are downloaded, not shipped in OpenSmash: none of the GitHub ones declares a licence, and
 GameBanana's pages don't allow re-uploads. Each download is checked against the SHA-256 recorded
 here, so a changed release is noticed (update the entry after checking the new one runs)."""
 import hashlib
@@ -31,9 +31,9 @@ PLUGINS = {
                             "one_slot_eff_13-0-5/atmosphere/contents/01006A800016E000/romfs/skyline/plugins/libone_slot_eff.nro",
                             "ee27ab9735b06b372ae4e6f8cd208bceb42ee488b02bdf3ff1b62b72fa9a0327",
                             "gamebanana.com/mods/549058 (One Slot Effects [Updated])", "runs"),
-    "libthe_csk_collection.nro": ("5.0.6", "https://gamebanana.com/dl/1745532",
+    "libthe_csk_collection.nro": ("6.0.1", "https://gamebanana.com/dl/1884395",
                                   "atmosphere/contents/01006A800016E000/romfs/skyline/plugins/libthe_csk_collection.nro",
-                                  "4d91c3d771b5c846a58ba31e123ff2aca5847614493235e754930a621c19c892",
+                                  "6371338d0bf4cd13d2d139f080dcb8d243a5c5927ac85056de6d0d15a04fe68e",
                                   "gamebanana.com/mods/499008 (The CSK Collection)", "runs"),
     "libsmashline_plugin.nro": ("2.0.0", "https://github.com/HDR-Development/smashline/releases/download/v2.0.0/libsmashline_plugin.nro",
                                 None, "d57a437000d13a85192b79941880b4e3b671d0e4a0291951d426f0f6773e6b92",
@@ -52,7 +52,7 @@ PLUGINS = {
 
 
 # plugins built for an older game version: the address map that ports each to 13.0.5 (tools/ports/)
-PORTS = {"libthe_csk_collection.nro": "the_csk_collection-5.0.6.txt"}
+PORTS = {"libthe_csk_collection.nro": "the_csk_collection-6.0.1.txt"}
 
 
 def arg(name, default=None):
@@ -64,7 +64,7 @@ def folder(tree):
 
 
 def download(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "WindowSmash"})
+    req = urllib.request.Request(url, headers={"User-Agent": "OpenSmash"})
     with urllib.request.urlopen(req, timeout=120) as r:
         return r.read()
 

@@ -27,7 +27,11 @@
  * makes every call to them, as on Windows - it must: SDL's IOKit pads hang on the run loop of the
  * thread that started them, which only that thread runs (in SDL_UpdateGamepads). The pads of
  * GameController.framework (Xbox and MFi pads over Bluetooth) come and go through notifications
- * on the main thread, whose event loop runs for good. No XInput either. */
+ * on the main thread, whose event loop runs for good. No XInput either.
+ *
+ * Switch 2 controllers over Bluetooth (the Pro Controller 2 and Joy-Con 2s, which SDL reads over USB only) come from
+ * hle_padble.c on Windows, as ports like the USB GameCube ones (ble_poll), with HD rumble from the game's own values
+ * (pad_vibration). [general] switch2_bluetooth = 1 turns it on (0, the default, leaves Bluetooth alone). */
 #define _CRT_SECURE_NO_WARNINGS
 #include <ctype.h>
 #include <math.h>
@@ -36,6 +40,7 @@
 #include "config_folder.h"
 #include "pad.h"
 #include "padusb.h"
+#include "padble.h"
 #include "settings.h"
 #ifdef SSBU_HAVE_SDL3
 #include <SDL3/SDL_init.h>
@@ -100,6 +105,7 @@ static struct {
     int background;
     int rumble;                   /* 0: no pad rumbles ([general] rumble) */
     int gc_switch;                /* 1: the GameCube adapter's sticks as the console scales them ([general] gc_switch) */
+    int switch2;                  /* Switch 2 controllers over Bluetooth: 0 off, 1 on, 2 on and every advertising device logged ([general] switch2_bluetooth) */
     char pin[PAD_SLOTS][96];
     char ignore[16][96];          /* [general] ignore = <GUID, name or type>: pads never used */
     int nignore;
@@ -108,7 +114,7 @@ static struct {
     int kb[PAD_KEYS][PAD_KEY_MAX], nkb[PAD_KEYS];   /* [keyboard]: each binding's keys (virtual-key codes) */
     int kb_ssf2;                  /* [keyboard] movement = ssf2 (pad_keyboard_state) */
     char path[MAX_PATH];
-} cfg = {.keyboard_slot = 0, .background = 1, .rumble = 1, .gc_switch = 1, .def = {"", -1, -1, -1, -1, -1, -1, -1}};
+} cfg = {.keyboard_slot = 0, .background = 1, .rumble = 1, .gc_switch = 1, .switch2 = 0, .def = {"", -1, -1, -1, -1, -1, -1, -1}};
 
 static void kb_defaults(void);
 
@@ -120,6 +126,7 @@ static void config_defaults(void) {
     cfg.background = 1;
     cfg.rumble = 1;
     cfg.gc_switch = 1;
+    cfg.switch2 = 0;   /* (opt-in: its active Bluetooth scan runs for good, a cost with no such controller) */
     cfg.def.layout = cfg.def.style = cfg.def.deadzone = cfg.def.rumble = cfg.def.trigger = cfg.def.outer = cfg.def.invert = cfg.def.dpad_moves = cfg.def.stick_taunts = -1;
     memcpy(cfg.path, path, sizeof path);
     kb_defaults();
@@ -143,8 +150,15 @@ static const char DEFAULT_INI[] =
     "; rumble = 1: controllers rumble (each as strong as its own rumble below). 0: no controller rumbles.\n"
     "rumble = 1\n"
     "; gc_switch = 1: a GameCube adapter's sticks and triggers are scaled as a Switch console does (the same numbers, no dead\n"
-    "; zone). 0: the earlier scaling, with a dead zone and a reach that grows to fit the stick.\n"
+    "; zone). 0: the earlier scaling, with a dead zone and a reach that grows to fit the stick. An adapter in PC mode\n"
+    "; (Mayflash 0079:1844 and clones) scales each stick itself, so there the sticks are an estimate of the console's.\n"
     "gc_switch = 1\n"
+    "; switch2_bluetooth = 1: Switch 2 controllers (Pro Controller 2, Joy-Con 2) over Bluetooth, read by the game itself (Windows):\n"
+    ";   hold the controller's Sync button until its lights sweep - no pairing in Windows' settings - and from then on a\n"
+    ";   press of any button connects it. Two Joy-Con 2s play as one controller; SL + SR held 3 s on one of them makes\n"
+    ";   each its own player (held sideways); L on the left one and R on the right one held 3 s join them again.\n"
+    ";   HD rumble plays the game's own vibration. 0 (the default): Bluetooth left alone. 2: also logs every Bluetooth device it sees.\n"
+    "switch2_bluetooth = 0\n"
     "; ignore = <GUID, name or type>: a pad that is never used (one line each), e.g. a wheel or a second driver\n"
     ";          of the same controller.\n"
     "; ignore = 03000000efbe00006d04000000000000\n"
@@ -238,7 +252,7 @@ static const char DEFAULT_INI[] =
     "; rumble = 60\n"
     "\n"
     "; GameCube adapters in PC mode (Mayflash USB 0079:1844, DragonRise-chip clones such\n"
-    "; as 0079:1846) need nothing here as of SDL 3.4: SDL reads them with its own GameCube\n"
+    "; as 0079:1846) need nothing here as of SDL 3.4 (their sticks follow gc_switch above): SDL reads them with its own GameCube\n"
     "; driver and already hands the C-stick over the right way up. With an older SDL (or a\n"
     "; Linux build without its HIDAPI GameCube driver) the C-stick comes up inverted; then\n"
     "; match the pad and flip it back, e.g.:\n"
@@ -697,8 +711,8 @@ static void kb_ssf2(u64 *buttons, i32 *lx, i32 *ly) {
 }
 
 /* The keyboard as the console's buttons and sticks, with down(vk) saying whether a key is held. A
- * key on a stick direction pushes that stick fully (both of a pair held: right and down win, as
- * before), which the game takes as a flick: a dash, a drop through a platform. While WALK (Shift)
+ * key on a stick direction pushes that stick fully, two keys a diagonal to the circle's edge (both of a
+ * pair held: right and down win, as before), which the game takes as a flick: a dash, a drop through a platform. While WALK (Shift)
  * is held, the left stick goes part way instead: 0.60 sideways walks without dashing and makes tilts,
  * 0.655 down crouches on a platform without dropping through (measured in fights: ssbu-recomp's
  * keyboard ssf2, commit cd366ea). Enter does nothing while Alt is held (Alt+Enter is full screen). */
@@ -723,6 +737,11 @@ u64 pad_keyboard_state(int (*down)(int vk), i32 *lx, i32 *ly, i32 *rx, i32 *ry) 
     if (held[22]) *rx = 32767;
     if (held[21]) *ry = 32767;
     if (held[23]) *ry = -32767;
+    /* (a diagonal: the stick at full reach on the circle, 23170 = 32767 / sqrt 2 each way, as a real stick and yuzu
+     * give it - not the square's corner, whose full x made down+forward a dash, so no crawl and no crouch-cancel: #527;
+     * WALK's part-way push is already inside the circle; ssf2 movement sets its own part-way pushes) */
+    if (!held[24] && !kb_ssf2_on() && (held[16] || held[18]) && (held[17] || held[19])) { *lx = *lx < 0 ? -23170 : 23170; *ly = *ly < 0 ? -23170 : 23170; }
+    if ((held[20] || held[22]) && (held[21] || held[23])) { *rx = *rx < 0 ? -23170 : 23170; *ry = *ry < 0 ? -23170 : 23170; }
     if (kb_ssf2_on() && !held[24]) kb_ssf2(&buttons, lx, ly);   /* (WALK held: its own part-way push) */
     return buttons;
 }
@@ -735,6 +754,7 @@ static void config_set(const char *section, const char *key, char *value, int li
     } else if (!_stricmp(section, "general") && !_stricmp(key, "background")) cfg.background = atoi(value) != 0;
     else if (!_stricmp(section, "general") && !_stricmp(key, "rumble")) cfg.rumble = atoi(value) != 0;
     else if (!_stricmp(section, "general") && !_stricmp(key, "gc_switch")) cfg.gc_switch = atoi(value) != 0;
+    else if (!_stricmp(section, "general") && !_stricmp(key, "switch2_bluetooth")) cfg.switch2 = atoi(value) < 0 ? 0 : atoi(value) > 2 ? 2 : atoi(value);
     else if (!_stricmp(section, "general") && !_stricmp(key, "ignore")) {
         if (cfg.nignore < (int)(sizeof cfg.ignore / sizeof *cfg.ignore)) snprintf(cfg.ignore[cfg.nignore++], sizeof cfg.ignore[0], "%s", value);
     }
@@ -856,6 +876,10 @@ typedef struct Dev {
     int used, slot;               /* slot -1: no free player */
     int xinput;                   /* XInput user index, or -1 for an SDL pad */
     int usb;                      /* hle_padusb.c's port + 1, or 0 */
+    int ble;                      /* hle_padble.c's port + 1, or 0 */
+    unsigned ble_gen;             /* (ble) the port's pad this is (a Joy-Con pair split or joined is another) */
+    LONG vib_seen;                /* (ble) the slot's vibration last sent (pad_vibration's count) */
+    int vib_live;                 /* (ble) what was last sent rumbles */
     int exact;                    /* (usb) the sticks are already the console's (gc_switch): the #153 defaults below don't apply */
     int dz_default, outer_default;  /* the dead zone / outer zone are the GameCube defaults (10 / 98), not a choice */
 #ifdef SSBU_HAVE_SDL3
@@ -1070,6 +1094,28 @@ static void stick(int deadzone, int outer, i32 x, i32 y_down, i32 *ox, i32 *oy) 
     *oy = (i32)lround(fy * scale);
 }
 
+/* GameCube adapters in PC mode (Mayflash 0079:1844 and clones, read by SDL as an ordinary joystick): the adapter scales each
+ * stick so that its own rim is the whole 0-255 range (notch test 11-16: about 1.3 times the Wii U mode's counts on the left
+ * stick, about 1.5 times on the C-stick, clipped at both ends), so the console's counts cannot be read back exactly. An
+ * estimate: the typical rim of a GameCube stick, 100 counts left and 87 for the C-stick, turned into counts and then
+ * scaled as the console does (56 and 44, see padusb_set_switch). The Wii U mode stays the exact one. */
+static int gc_switch_on(void) {
+    static int env = -2;
+    if (env == -2) { const char *e = getenv("SSBU_GC_SWITCH"); env = e && !strcmp(e, "0") ? 0 : e && !strcmp(e, "1") ? 1 : -1; }
+    return env >= 0 ? env : cfg.gc_switch;
+}
+static int dev_gc_pcmode(const Dev *d) {
+    /* (GUID bytes 4-5: vendor 0x0079, 6-7 reserved, 8-9 product, little endian: 0x1844 / 0x1846 are the Mayflash-style adapters) */
+    return !d->usb && d->gc && strlen(d->guid) >= 20 && !_strnicmp(d->guid + 8, "7900", 4) && (!_strnicmp(d->guid + 16, "4418", 4) || !_strnicmp(d->guid + 16, "4618", 4));
+}
+static void pcmode_stick(i32 x, i32 y_down, int rim, int n, i32 *ox, i32 *oy) {
+    long cx = lround(x * (double)rim / 32767.0), cy = lround(-(double)y_down * rim / 32767.0), r2 = cx * cx + cy * cy, v, w;
+    if (r2 <= (long)n * n) { v = cx * 32767L / n; w = cy * 32767L / n; }
+    else { double r = sqrt((double)r2); v = (long)(cx * 32767.0 / r); w = (long)(cy * 32767.0 / r); }
+    *ox = (i32)(v > 32767 ? 32767 : v < -32767 ? -32767 : v);
+    *oy = (i32)(w > 32767 ? 32767 : w < -32767 ? -32767 : w);
+}
+
 /* As a GameCube controller, L and R are analog: the furthest-pulled of their controls (a button
  * counts as fully pulled). The game makes the buttons out of them itself. */
 static i32 dev_trigger(const Dev *d, const Raw *raw, int b) {
@@ -1117,9 +1163,16 @@ static void dev_state(Dev *d, const Raw *raw, PadState *o) {
     for (int a = 0; a < 4; a++)
         if (d->invert >> a & 1) ax[a] = ax[a] <= -32768 ? 32767 : -ax[a];
     /* (the console's own numbers need no zone of ours: the defaults of #153 stand aside for them, a zone the player set stays) */
+    /* (a dead zone or outer zone the player set stays, as for the Wii U mode: then the stick goes the earlier way) */
+    int pc = gc_switch_on() && dev_gc_pcmode(d) && d->dz_default && d->outer_default;
     int dz = d->exact && d->dz_default ? 0 : d->deadzone, outer = d->exact && d->outer_default ? 100 : d->outer;
-    stick(dz, outer, ax[0], ax[1], &o->lx, &o->ly);
-    stick(dz, outer, ax[2], ax[3], &o->rx, &o->ry);
+    if (pc) {
+        pcmode_stick(ax[0], ax[1], 100, 56, &o->lx, &o->ly);
+        pcmode_stick(ax[2], ax[3], 87, 44, &o->rx, &o->ry);
+    } else {
+        stick(dz, outer, ax[0], ax[1], &o->lx, &o->ly);
+        stick(dz, outer, ax[2], ax[3], &o->rx, &o->ry);
+    }
     u64 taunts = 0;
     if (d->stick_taunts) {   /* the left stick's directions as the D-pad's buttons (the taunts); past half way, the stick itself goes still */
         if (o->ly > 16383) taunts |= 1ull << N_UP;
@@ -1145,6 +1198,9 @@ static char slot_names[PAD_SLOTS][48];
 static PadInfo slot_info[PAD_SLOTS];
 static float rumble_amp[PAD_SLOTS][2];
 static ULONGLONG rumble_at[PAD_SLOTS];
+static float vib_values[PAD_SLOTS][2][4];   /* (pad_vibration) the game's last VibrationValue of each side, as it sent it */
+static LONG vib_count[PAD_SLOTS];
+static ULONGLONG vib_at[PAD_SLOTS];
 
 /* What the settings menu shows of a pad, and its controls as pressed now (PAD_RAW_*). */
 static void dev_info(const Dev *d, const Raw *raw, PadInfo *o) {
@@ -1193,6 +1249,8 @@ static void dev_info(const Dev *d, const Raw *raw, PadInfo *o) {
     if (raw->axis[RA_RIGHT_TRIGGER] > 16384) o->raw |= PAD_RAW_RIGHT_TRIGGER;
     o->gc = d->gc;
     o->dz_default = d->dz_default;
+    o->pc_mode = dev_gc_pcmode(d);
+    o->pc_scaled = o->pc_mode && gc_switch_on() && d->dz_default && d->outer_default;
     o->usb_port = d->usb - 1;
     memcpy(o->axis, raw->axis, sizeof o->axis);
     memcpy(o->axis_lo, d->axis_lo, sizeof o->axis_lo);
@@ -1373,6 +1431,93 @@ static void usb_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48], PadIn
     }
 }
 
+/* ---- Switch 2 controllers over Bluetooth LE (hle_padble.c) --------------------------------
+ * Its ports become pads as the USB ports do. Their buttons are already by place (A the right face button: a Nintendo
+ * pad's letters are where the console's are), a sideways Joy-Con's turned to how it is held; ZL and ZR are buttons.
+ * Rumble: the game's whole vibration values (pad_vibration), scaled by the pad's strength; nothing after 3 s without one. */
+static int ble_on;   /* (hle_padble.c's thread started) */
+
+static void ble_raw(const PadBleState *s, Raw *raw) {
+    static const struct { u32 pb; int rb; } MAP[] = {
+        {PB_A, RB_EAST}, {PB_B, RB_SOUTH}, {PB_X, RB_NORTH}, {PB_Y, RB_WEST}, {PB_LSTICK, RB_LEFT_STICK}, {PB_RSTICK, RB_RIGHT_STICK},
+        {PB_L, RB_LEFT_SHOULDER}, {PB_R, RB_RIGHT_SHOULDER}, {PB_PLUS, RB_START}, {PB_MINUS, RB_BACK}, {PB_LEFT, RB_DPAD_LEFT},
+        {PB_UP, RB_DPAD_UP}, {PB_RIGHT, RB_DPAD_RIGHT}, {PB_DOWN, RB_DPAD_DOWN}, {PB_HOME, RB_GUIDE}, {PB_CAPTURE, RB_MISC1},
+        {PB_C, RB_MISC2}, {PB_GR, RB_RIGHT_PADDLE1}, {PB_GL, RB_LEFT_PADDLE1},
+    };
+    memset(raw, 0, sizeof *raw);
+    for (u32 i = 0; i < sizeof MAP / sizeof *MAP; i++)
+        if (s->buttons & MAP[i].pb) raw->buttons |= 1u << MAP[i].rb;
+    raw->axis[RA_LEFTX] = s->lx; raw->axis[RA_LEFTY] = s->ly;
+    raw->axis[RA_RIGHTX] = s->rx; raw->axis[RA_RIGHTY] = s->ry;
+    raw->axis[RA_LEFT_TRIGGER] = s->buttons & PB_ZL ? 32767 : 0;
+    raw->axis[RA_RIGHT_TRIGGER] = s->buttons & PB_ZR ? 32767 : 0;
+}
+
+static void ble_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48], PadInfo info[PAD_SLOTS]) {
+    static PadBleState ports[PADBLE_PORTS];
+    static const int LABELS[4] = {N_B, N_A, N_Y, N_X};   /* (south, east, west, north: the letters where the console has them) */
+    ULONGLONG now = GetTickCount64();
+    padble_poll(ports);
+    for (int i = 0; i < (int)(sizeof devs / sizeof *devs); i++) {   /* gone, or its port another pad now */
+        Dev *d = &devs[i];
+        if (!d->used || !d->ble || (ports[d->ble - 1].connected && ports[d->ble - 1].gen == d->ble_gen)) continue;
+        if (d->slot >= 0) fprintf(stderr, "[input] player %d: \"%s\" disconnected\n", d->slot + 1, d->name);
+        d->used = 0;
+    }
+    for (int p = 0; p < PADBLE_PORTS; p++) {   /* came (devs 0-3 are XInput's when there is no SDL) */
+        int open = !ports[p].connected;
+        for (int i = 0; i < (int)(sizeof devs / sizeof *devs) && !open; i++) open = devs[i].used && devs[i].ble == p + 1;
+        Dev *d = NULL;
+        for (int i = 4; i < (int)(sizeof devs / sizeof *devs) && !open && !d; i++) if (!devs[i].used) d = &devs[i];
+        if (!d) continue;
+        memset(d, 0, sizeof *d);
+        d->used = 1; d->xinput = -1; d->ble = p + 1; d->ble_gen = ports[p].gen;
+        snprintf(d->name, sizeof d->name, "%s", ports[p].name);
+        snprintf(d->type, sizeof d->type, "%s", ports[p].id);
+        snprintf(d->guid, sizeof d->guid, "%s", ports[p].id);
+        snprintf(d->serial, sizeof d->serial, "%s", ports[p].serial);
+        snprintf(d->path, sizeof d->path, "%s", ports[p].path);
+        dev_configure(d, LABELS);
+        d->slot = dev_assign(d);
+        if (d->slot >= 0) dev_remember(d);
+        log_connect(d);
+    }
+    for (int i = 0; i < (int)(sizeof devs / sizeof *devs); i++) {
+        Dev *d = &devs[i];
+        if (!d->used || !d->ble) continue;
+        if (d->slot < 0 && (d->slot = dev_assign(d)) >= 0) { dev_remember(d); log_connect(d); }   /* a player became free */
+        padble_player(d->ble - 1, d->slot);   /* (its player lights: also after controllers.ini is read again) */
+        if (d->slot < 0) continue;
+        Raw raw;
+        ble_raw(&ports[d->ble - 1], &raw);
+        dev_state(d, &raw, &fresh[d->slot]);
+        dev_info(d, &raw, &info[d->slot]);
+        snprintf(names[d->slot], sizeof names[d->slot], "%s", d->name);
+        float v[2][4];
+        LONG count;
+        ULONGLONG at;
+        AcquireSRWLockShared(&lock);
+        memcpy(v, vib_values[d->slot], sizeof v);
+        count = vib_count[d->slot];
+        at = vib_at[d->slot];
+        ReleaseSRWLockShared(&lock);
+        if (now - at > 3000 || !cfg.rumble || d->rumble <= 0) {   /* (the game stopped sending, or rumble is off: still) */
+            if (d->vib_live) {
+                static const float still[2][4] = {{0, 160, 0, 320}, {0, 160, 0, 320}};
+                padble_vibrate(d->ble - 1, still);
+                d->vib_live = 0;
+            }
+            d->vib_seen = count;
+        } else if (count != d->vib_seen) {
+            d->vib_seen = count;
+            float k = d->rumble / 100.0f;
+            for (int m = 0; m < 2; m++) { v[m][0] *= k; v[m][2] *= k; }
+            padble_vibrate(d->ble - 1, (const float (*)[4])v);
+            d->vib_live = v[0][0] > 0 || v[0][2] > 0 || v[1][0] > 0 || v[1][2] > 0;
+        }
+    }
+}
+
 /* ---- SDL3 ---------------------------------------------------------------------------- */
 #ifdef SSBU_HAVE_SDL3
 #define SDL_FUNCS(X) X(SDL_SetHint) X(SDL_Init) X(SDL_GetError) X(SDL_free) X(SDL_GetVersion) \
@@ -1466,7 +1611,7 @@ static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48], PadIn
         SDL_JoystickID *ids = p_SDL_GetGamepads(&n);
         for (int i = 0; i < (int)(sizeof devs / sizeof *devs); i++) {
             Dev *d = &devs[i];
-            if (!d->used || d->usb) continue;
+            if (!d->used || d->usb || d->ble) continue;
             int present = 0;
             for (int k = 0; k < n && !present; k++) present = ids[k] == d->id;
             if (present && p_SDL_GamepadConnected(d->gp)) continue;
@@ -1480,7 +1625,7 @@ static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48], PadIn
             if (!open) sdl_open(ids[k]);
         }
         for (int i = 0; i < (int)(sizeof devs / sizeof *devs); i++)   /* a player became free */
-            if (devs[i].used && !devs[i].usb && devs[i].slot < 0 && (devs[i].slot = dev_assign(&devs[i])) >= 0) {
+            if (devs[i].used && !devs[i].usb && !devs[i].ble && devs[i].slot < 0 && (devs[i].slot = dev_assign(&devs[i])) >= 0) {
                 dev_remember(&devs[i]);
                 p_SDL_SetGamepadPlayerIndex(devs[i].gp, devs[i].slot);
                 log_connect(&devs[i]);
@@ -1489,7 +1634,7 @@ static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48], PadIn
     }
     for (int i = 0; i < (int)(sizeof devs / sizeof *devs); i++) {
         Dev *d = &devs[i];
-        if (!d->used || d->usb || d->slot < 0) continue;
+        if (!d->used || d->usb || d->ble || d->slot < 0) continue;
         Raw raw = {0};
         for (int b = 0; b < RB_COUNT; b++)
             if (p_SDL_GetGamepadButton(d->gp, (SDL_GamepadButton)b)) raw.buttons |= 1u << b;
@@ -1581,7 +1726,7 @@ static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48], PadIn
         int n = SDL_NumJoysticks();
         for (int i = 0; i < (int)(sizeof devs / sizeof *devs); i++) {
             Dev *d = &devs[i];
-            if (!d->used || d->usb || SDL_GameControllerGetAttached(d->gp)) continue;
+            if (!d->used || d->usb || d->ble || SDL_GameControllerGetAttached(d->gp)) continue;
             if (d->slot >= 0) fprintf(stderr, "[input] player %d: \"%s\" disconnected\n", d->slot + 1, d->name);
             SDL_GameControllerClose(d->gp);
             d->used = 0;
@@ -1594,7 +1739,7 @@ static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48], PadIn
             if (!open) sdl_open(k);
         }
         for (int i = 0; i < (int)(sizeof devs / sizeof *devs); i++)   /* a player became free */
-            if (devs[i].used && !devs[i].usb && devs[i].slot < 0 && (devs[i].slot = dev_assign(&devs[i])) >= 0) {
+            if (devs[i].used && !devs[i].usb && !devs[i].ble && devs[i].slot < 0 && (devs[i].slot = dev_assign(&devs[i])) >= 0) {
                 dev_remember(&devs[i]);
                 SDL_GameControllerSetPlayerIndex(devs[i].gp, devs[i].slot);
                 log_connect(&devs[i]);
@@ -1602,7 +1747,7 @@ static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48], PadIn
     }
     for (int i = 0; i < (int)(sizeof devs / sizeof *devs); i++) {
         Dev *d = &devs[i];
-        if (!d->used || d->usb || d->slot < 0) continue;
+        if (!d->used || d->usb || d->ble || d->slot < 0) continue;
         Raw raw = {0};
         for (int b = 0; b < SDL_CONTROLLER_BUTTON_MAX && b < RB_COUNT; b++)
             if (SDL_GameControllerGetButton(d->gp, (SDL_GameControllerButton)b)) raw.buttons |= 1u << b;
@@ -1694,8 +1839,12 @@ static DWORD WINAPI input_thread(LPVOID unused) {
     HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     if (!timer) timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
     usb_ignore = padusb_start();
+    {   const char *e = getenv("SSBU_SWITCH2");   /* (over controllers.ini's switch2_bluetooth) */
+        int want = e && *e ? atoi(e) : cfg.switch2;
+        ble_on = want > 0 && padble_start(want >= 2);
+        if (want <= 0) fprintf(stderr, "[input] Switch 2 controllers over Bluetooth: off (controllers.ini switch2_bluetooth = 0)\n"); }
     int sdl = sdl_start(), xinput = !sdl && xinput_start();
-    if (!sdl && !xinput && !usb_ignore) { fprintf(stderr, "[input] no SDL and no XInput: keyboard only\n"); return 0; }
+    if (!sdl && !xinput && !usb_ignore && !ble_on) { fprintf(stderr, "[input] no SDL and no XInput: keyboard only\n"); return 0; }
     for (;;) {
         PadState fresh[PAD_SLOTS] = {0};
         char names[PAD_SLOTS][48] = {{0}};
@@ -1705,6 +1854,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
         if (sdl) sdl_poll(fresh, names, info);
         else if (xinput) xinput_poll(fresh, names, info);
         if (usb_ignore) usb_poll(fresh, names, info);
+        if (ble_on) ble_poll(fresh, names, info);
         publish(fresh, names, info);
         LARGE_INTEGER due = {.QuadPart = -10000};   /* 1 ms */
         if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, 50);
@@ -1737,13 +1887,22 @@ int pad_get(u32 slot, PadState *out) {
 int pad_keyboard_slot(void) { pad_start(); return cfg.keyboard_slot; }
 int pad_background(void) { pad_start(); return cfg.background; }
 int pad_rumble_on(void) { pad_start(); return cfg.rumble; }
-int pad_gc_switch(void) { pad_start(); return cfg.gc_switch; }
+int pad_gc_switch(void) { pad_start(); return gc_switch_on(); }   /* (SSBU_GC_SWITCH wins over the file, as for the sticks) */
 
 void pad_rumble(u32 slot, int side, float amplitude) {
     if (slot >= PAD_SLOTS || side < 1 || side > 2) return;
     AcquireSRWLockExclusive(&lock);
     rumble_amp[slot][side - 1] = amplitude;
     rumble_at[slot] = GetTickCount64();
+    ReleaseSRWLockExclusive(&lock);
+}
+
+void pad_vibration(u32 slot, int side, const float v[4]) {
+    if (slot >= PAD_SLOTS || side < 0 || side > 1) return;
+    AcquireSRWLockExclusive(&lock);
+    memcpy(vib_values[slot][side], v, sizeof vib_values[slot][side]);
+    vib_count[slot]++;
+    vib_at[slot] = GetTickCount64();
     ReleaseSRWLockExclusive(&lock);
 }
 

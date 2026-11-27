@@ -1,4 +1,4 @@
-"""The Linux installer (install-windowsmash.sh, tools/linux/install_linux.py), the Linux build on a
+"""The Linux installer (install-opensmash.sh, tools/linux/install_linux.py), the Linux build on a
 Linux host (tools/linux/toolchain.py, build_game.py's step 9, recomp.py all --generate-only) and the
 launchers of a folder built on Linux. What runs only on Linux is stood in for; no game files."""
 from pathlib import Path
@@ -595,14 +595,22 @@ class GenerateOnlyTests(unittest.TestCase):
             for n in ('main', 'sdk'):
                 open(os.path.join(exefs, n), 'wb').close()
             stamps = []
+
+            def compile_dirs(targets, jobs, shown=None, steps=None, fatal=None, done=None, longest=False):   # (one pool: every module)
+                for t in targets:
+                    done(t)   # (build_all's stamp writer, not the list above)
+                compiled.append([os.path.basename(t) for t in targets])
+                return []
+            compiled = []
             g.update(
                 TREE=tmp, NRO_DIR=os.path.join(tmp, 'nro'),
                 module_paths=lambda e: {'main': os.path.join(e, 'main'), 'sdk': os.path.join(e, 'sdk')},
                 check=lambda e, mods=None: 0, tools_fingerprint=lambda: 'fp', image=lambda nso, img: done.append(('image', nso)),
                 Module=lambda nso: types.SimpleNamespace(build_id='b' * 64, text=types.SimpleNamespace(mem=0, end=4000)),
                 MODULES={'main': 1, 'sdk': 2}, stale_files=lambda target: [],
+                hook_imports=lambda mods, graphs=None: {},   # (tools/hooks.txt's exact callees: not this test's, and it lists one now)
                 build=lambda nso, target, jobs, per_file, imports=None: done.append(('build', os.path.basename(target))),
-                compile_dir=lambda target, jobs, shown=None, steps=None: done.append(('compile', target)) or True,
+                compile_dirs=compile_dirs,
                 link=lambda dirs, exe, steps=None: done.append(('link', exe)) or True,
                 modcache=types.SimpleNamespace(build_info=lambda t: None, find_built=lambda *x: None,
                                                write_stamp=lambda t, *x: stamps.append(os.path.basename(t))))
@@ -615,7 +623,13 @@ class GenerateOnlyTests(unittest.TestCase):
             done.clear()
             with contextlib.redirect_stdout(io.StringIO()), no_title:
                 self.assertTrue(g['build_all'](exefs, os.path.join(tmp, 'build'), 4))   # (the Windows build: both)
-            self.assertEqual([d[0] for d in done if d[0] in ('compile', 'link')], ['compile', 'compile', 'link'])
+            self.assertEqual(compiled, [['main', 'sdk']])   # (both modules in one pool)
+            self.assertEqual([d[0] for d in done if d[0] == 'link'], ['link'])
+            compiled.clear()   # (SSBU_ONE_QUEUE=0: module after module, as before)
+            g['one_queue'] = lambda: False
+            with contextlib.redirect_stdout(io.StringIO()), no_title:
+                self.assertTrue(g['build_all'](exefs, os.path.join(tmp, 'build'), 4))
+            self.assertEqual(compiled, [['main'], ['sdk']])
 
 
 def find_bash():
@@ -714,7 +728,7 @@ class LauncherTests(unittest.TestCase):
         (self.top / 'build-linux' / 'ssbu').unlink()
         r = self.run_launcher('launchers/play-ssbu-offline.sh')
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn('The game is not built yet (build-linux/ssbu): run  bash install-windowsmash.sh', r.stdout)
+        self.assertIn('The game is not built yet (build-linux/ssbu): run  bash install-opensmash.sh', r.stdout)
 
 
 @unittest.skipUnless(BASH, 'needs bash')

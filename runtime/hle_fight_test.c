@@ -87,8 +87,19 @@ static int ready_go(void);
  * here: the overlay runs on the presenting thread, which must not take the kernel's lock (kernel_read64) - the
  * game's thread holds it while it waits for the renderer, and the first try froze the game that way. */
 static volatile LONG fight_flag;
+/* (the frame line, below: a fight has ended since its fighters were listed - the next fighter seen starts the next fight) */
+static volatile LONG fight_ended;
 int game_fight_on(void) { return (int)fight_flag; }
-static void fight_flag_hook(Cpu *c, const u64 args[8], void *unused) { (void)c; (void)args; (void)unused; InterlockedExchange(&fight_flag, ready_go()); }
+int rb_ra_predicting(void);   /* (hle_rb_core.c: a run-ahead frame, thrown away at the load) */
+static void fight_flag_hook(Cpu *c, const u64 args[8], void *unused) {
+    (void)c; (void)args; (void)unused;
+    LONG on = ready_go(), was = InterlockedExchange(&fight_flag, on);
+    /* (only a ready-go that stays cleared ends the fight: one cleared on a predicted frame, or by a "GAME!" a rollback
+     * undoes, is set again at the next frame end and takes the end back) */
+    if (rb_ra_predicting()) return;
+    if (was && !on) InterlockedExchange(&fight_ended, 1);
+    else if (!was && on) InterlockedExchange(&fight_ended, 0);
+}
 static int ready_go(void) {
     static u64 inst;
     u64 mgr, impl, word;
@@ -108,6 +119,7 @@ static u64 rng_base(void) {
 /* ---- SSBU_FIGHT_HASH, SSBU_DETERMINISTIC --------------------------------------------------- */
 static int hash_on, det, det_off;
 static FILE *hash_out;
+void (*fight_lat_status)(int st, unsigned long long mot);   /* (SSBU_LAT_TRACE, ipc_vi.c: the first fighter's status and motion) */
 static u64 hash_run = FIGHT_FNV_BASIS;
 static struct { u64 boma; int entry; volatile long long frame; } fighters[8];
 static volatile int fighter_count;
@@ -124,10 +136,14 @@ static void global_rng_fixed(const char *when) {
     fprintf(stderr, "[fight] SSBU_DETERMINISTIC: the game's global generator set to a fixed state (%s)\n", when);
 }
 
+/* (each fight of the process: SSBU_SEQ's "fight" mark, raised at the first, stays raised; "fight:<n>" is the n-th's) */
+static int fights_seen;
 static void first_battle_frame(int entry) {
     u64 rb = rng_base();
-    fprintf(stderr, "[fight] first battle frame (fighter entry %d); input mark \"fight\" raised; script random generators at %llx\n",
-            entry, (unsigned long long)rb);
+    char nth[24];
+    snprintf(nth, sizeof nth, "fight:%d", ++fights_seen);
+    fprintf(stderr, "[fight] first battle frame (fighter entry %d); input marks \"fight\" and \"%s\" raised; script random generators at %llx\n",
+            entry, nth, (unsigned long long)rb);
     if (rb) {
         fprintf(stderr, "[fight] generators before:");
         for (int i = 0; i < FIGHT_RNGS; i++) fprintf(stderr, " %08x.%u", ld32(rb + 0x14ull * i + 12), ld32(rb + 0x14ull * i + 16));
@@ -141,6 +157,7 @@ static void first_battle_frame(int entry) {
     }
     if (det && !(det_off & DET_OFF_RNG)) global_rng_fixed("at the fight");
     input_seq_mark("fight");
+    input_seq_mark(nth);
 }
 
 
@@ -188,13 +205,31 @@ static void frame_line(Cpu *c) {
     int k = 0;
     while (k < fighter_count && fighters[k].boma != boma) k++;
     if (k == fighter_count) {
-        if (k == 8) return;
-        u64 id;
-        fighters[k].boma = boma;
-        fighters[k].frame = 0;
-        fighters[k].entry = entry_work_id(c, &id) ? (int)getter(c, FD("24WorkModule__get_int_impl") "i", boma, id, NULL) : -1;
-        fighter_count = k + 1;
-        if (k == 0) first_battle_frame(fighters[k].entry);
+        /* (a fighter added under the lock: two threads' new fighters at once must not take one slot, nor one of them
+         * land in the list the other just started again) */
+        static SRWLOCK adding = SRWLOCK_INIT;
+        AcquireSRWLockExclusive(&adding);
+        k = 0;
+        while (k < fighter_count && fighters[k].boma != boma) k++;
+        int added = k == fighter_count;
+        if (added) {
+            /* A fighter not seen yet after a fight ended (its ready-go cleared): the next fight - the next match of
+             * the process, a sudden death. The list starts again, so that fight has its first battle frame too (the
+             * "fight" marks, the fixed generators) and its frames count from 1. (Before, the list kept the first
+             * fight's fighters: a second fight never raised "fight", and the ninth fighter of a run had no lines.) */
+            if (fight_ended && InterlockedExchange(&fight_ended, 0)) k = fighter_count = 0;
+            if (k == 8) { ReleaseSRWLockExclusive(&adding); return; }
+            fighters[k].boma = boma;
+            fighters[k].frame = 0;
+            fighters[k].entry = -1;
+            fighter_count = k + 1;
+        }
+        ReleaseSRWLockExclusive(&adding);
+        if (added) {
+            u64 id;
+            if (entry_work_id(c, &id)) fighters[k].entry = (int)getter(c, FD("24WorkModule__get_int_impl") "i", boma, id, NULL);
+            if (k == 0) first_battle_frame(fighters[k].entry);
+        }
     }
     FightFrame fr = {++fighters[k].frame, fighters[k].entry};
     if (final_first && fr.f >= final_first) {   /* (one fighter at a time, in turn: SSBU_DEBUG_FINAL above) */
@@ -204,6 +239,7 @@ static void frame_line(Cpu *c) {
     if (!hash_out) return;
     fr.st = (int)getter(c, FD("30StatusModule__status_kind_impl"), boma, 0, NULL);
     fr.mot = getter(c, FD("30MotionModule__motion_kind_impl"), boma, 0, NULL);
+    if (k == 0 && fight_lat_status) fight_lat_status(fr.st, fr.mot);   /* (SSBU_LAT_TRACE: ipc_vi.c sets it) */
     getter(c, FD("24MotionModule__frame_impl"), boma, 0, &fr.mf);
     getter(c, FD("25PostureModule__pos_x_impl"), boma, 0, &fr.x);
     getter(c, FD("25PostureModule__pos_y_impl"), boma, 0, &fr.y);
@@ -323,6 +359,7 @@ static u64 stage_choice(void) {
  * registered while a debug match is on. Called on the game's main thread, one player at a time:
  * what the panel was is kept here between the two halves. */
 int input_seq2_on(void);   /* (hle_hid.c) */
+int net_match_on(void);    /* (hle_rb_core.c: a networked match is set up or under way) */
 static u64 record_was;
 static u32 record_type_was;
 static void record_before(Cpu *c, const u64 args[8], void *ctx) {
@@ -336,7 +373,18 @@ static void record_before(Cpu *c, const u64 args[8], void *ctx) {
         fprintf(stderr, "[fight] SSBU_DEBUG_MATCH_LIST: match %d\n", match_fight);
     }
     if (idx == 0 && det && !(det_off & DET_OFF_RNG)) global_rng_fixed("the match set-up");
-    type_was = dm_player(&match, idx, P(u8, st), type_was, match_p2_ok ? match_p2 : NULL);
+    u32 tag_was = ld32(st + 0x214);
+    DebugMatch m = match;
+    /* (a networked match: every game plays each player with the tag agreed in the handshake, hle_rb_core.c's record hook
+     * just before this one; a tag of this PC's list set here would be this game's alone - the peers would differ) */
+    if (idx >= 0 && idx < 4 && m.tag[idx] >= 0 && net_match_on()) {
+        fprintf(stderr, "[fight] debug match: tag%d ignored in a networked match (its tags come from the handshake)\n", idx + 1);
+        m.tag[idx] = -1;
+    }
+    type_was = dm_player(&m, idx, P(u8, st), type_was, match_p2_ok ? match_p2 : NULL);
+    if (idx >= 0 && idx < 4 && m.tag[idx] >= 0)   /* (#152: the name tag the screens left, and the one played: + 0x214 its slot + 1) */
+        fprintf(stderr, "[fight] debug match: player %d: name tag %u from the screens, %u played (human panel %u)\n", idx, tag_was,
+                ld32(st + 0x214), (unsigned)ld8(st + 0x450));
     if (idx == 0) {
         u64 sel = stage_choice(), block = GAME_ADDR(MATCH_BLOCK);
         fprintf(stderr, "[fight] debug match: the screens' stage choice: ui_stage %llx form %u, hazards %u; rule: stock %u, item appear %u\n",
@@ -419,21 +467,41 @@ void test_fight_presented(void) {
  * end, before the match loads, the game waits for them (gfx_match_wait) - on a first start, where the driver compiles each
  * pipeline from nothing, a longer wait on the select screen instead of compiles during the fight. (Not at the fight's first
  * frame line: the stage and the fighters' entrances are drawn before it.) After the debug match's own record hook (an
- * inner order: its fighters and stage are the ones set). */
+ * inner order: its fighters and stage are the ones set). The human players' fighters and the stage are also counted for the
+ * next starts, whose warm start makes the most played ones first (gfx_warm_hint pick 1: record + 0xa, the type, 0 a human);
+ * and outside fights each frame end looks at the stage screen's choice (STAGE_CHOICES' entry in use, 0x69 << 56 | hash40
+ * once one is chosen): a new one has its pipelines made next (gfx_warm_hint pick 0), before the match is set up. */
 void gfx_match_want(unsigned long long key, int first);   /* gpu_backend.c */
 void gfx_match_wait(void);
+void gfx_warm_hint(unsigned long long key, int pick);
 static volatile LONG shaders_pending;
+static u64 shaders_stage_seen;
 static void shaders_record(Cpu *c, const u64 args[8], void *ctx) {
     (void)c; (void)ctx;
     int idx = (int)args[1];
     u64 rec = args[3];
-    if (idx == 0) gfx_match_want(ld64(stage_choice()) & 0xFFFFFFFFFFull, 1);
-    if (rec && (i8)ld8(rec + 8) >= 0) gfx_match_want(ld64(rec) & 0xFFFFFFFFFFull, 0);
+    if (idx == 0) {
+        u64 stage = ld64(stage_choice()) & 0xFFFFFFFFFFull;
+        gfx_match_want(stage, 1);
+        gfx_warm_hint(stage, 1);
+        shaders_stage_seen = stage;
+    }
+    if (rec && (i8)ld8(rec + 8) >= 0) {
+        gfx_match_want(ld64(rec) & 0xFFFFFFFFFFull, 0);
+        if (ld8(rec + 0xa) == 0) gfx_warm_hint(ld64(rec) & 0xFFFFFFFFFFull, 1);
+    }
     InterlockedExchange(&shaders_pending, 1);
 }
 static void shaders_end(Cpu *c, const u64 args[8], void *ctx) {
     (void)c; (void)args; (void)ctx;
     if (shaders_pending && InterlockedExchange(&shaders_pending, 0)) gfx_match_wait();
+    else if (!fight_flag) {
+        u64 choice = ld64(stage_choice());
+        if (choice >> 56 == 0x69 && (choice & 0xFFFFFFFFFFull) != shaders_stage_seen) {
+            shaders_stage_seen = choice & 0xFFFFFFFFFFull;
+            gfx_warm_hint(shaders_stage_seen, 0);
+        }
+    }
 }
 
 /* ---- start --------------------------------------------------------------------------------- */
@@ -457,9 +525,11 @@ void test_fight_start(void) {
         final_every = comma ? strtoll(comma + 1, NULL, 10) : 0;
         fprintf(stderr, "[fight] SSBU_DEBUG_FINAL: the fighters' Final Smashes in turn, the first at fight frame %lld, then one every %lld\n", final_first, final_every ? final_every : 600);
     } else final_first = 0;
-    if (hash_on || det || final_first) {
-        fprintf(stderr, "[fight] SSBU_FIGHT_HASH %s, SSBU_DETERMINISTIC %d (off mask %d): the fighters' frame line is watched\n",
-                hash_on ? "on" : "off", det, det_off);
+    /* (SSBU_SEQ: its "fight" mark is raised at the first battle frame, so the line is watched for it too - without the
+     * hash or the deterministic mode a sequence's @fight waited for ever) */
+    if (hash_on || det || final_first || input_seq_on()) {
+        fprintf(stderr, "[fight] SSBU_FIGHT_HASH %s, SSBU_DETERMINISTIC %d (off mask %d)%s: the fighters' frame line is watched\n",
+                hash_on ? "on" : "off", det, det_off, input_seq_on() ? ", SSBU_SEQ's fight mark" : "");
         frame_hook_add(FRAME_HOOK_LINE, FRAME_ORDER_FIGHT_TEST, frame_line_hook, NULL, NULL);
     }
     if (det) frame_hook_add(FRAME_HOOK_END, FRAME_ORDER_FIGHT_TEST, NULL, frame_end_hook, NULL);

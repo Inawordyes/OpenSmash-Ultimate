@@ -38,7 +38,14 @@ param([switch]$Auto, [switch]$DryRun, [switch]$NoWindow, [string]$Root)
 if (-not $Root) { $Root = Split-Path -Parent $PSScriptRoot }
 $Root = (Resolve-Path -LiteralPath $Root).Path   # (.NET's file calls want it whole)
 
-$PublicLobby = 'opensmash-lobby.duckdns.org:39421'   # (the one public lobby: runtime/net_relay.c)
+$PublicLobby = 'eu.lobby.opensmashultimate.com:39421'   # (the official lobby's DNS name: runtime/net.h's NET_OFFICIAL_LOBBY)
+# The official lobbies, one a region (runtime/net.h's NET_REGION_TABLE): id, the name shown, the lobby. Which one the
+# game plays on is config\server_region.txt's to say ("auto", the default: the closest; or an id), set in the game's
+# own settings menu (Esc > Online > Server region) or in OpenSmash.exe. Players on another region are not listed.
+$ServerRegions = @(
+    @{ Id = 'eu'; Label = 'EU'; Lobby = 'eu.lobby.opensmashultimate.com:39421' },
+    @{ Id = 'na-east'; Label = 'NA East'; Lobby = 'na.lobby.opensmashultimate.com:39421' },
+    @{ Id = 'sa'; Label = 'South America'; Lobby = 'sa.lobby.opensmashultimate.com:39421' })
 # The game's own values when a file or key is missing (runtime/gpu_display.c, hle_pad.c).
 $Defaults = @{
     window = 'windowed'; width = '1280'; height = '720'; pacing = 'clock'; latency = '3'
@@ -323,13 +330,14 @@ $serverWords = @(([string](Get-LineValue $serverFile)).Trim() -split '[ \t]+') +
 $lobbyHost = $serverWords[0]
 $lobbyCode = $serverWords[1]
 $netMode = if (-not $lobbyHost -or $lobbyHost -eq 'off') { 'offline' }
-           elseif ($lobbyHost -eq $PublicLobby -or $lobbyHost -like 'smash.recomps.wtf*' -or @('auto', 'na', 'eu') -contains $lobbyHost) { if ($lobbyCode) { 'private' } else { 'public' } }
+           elseif ($lobbyHost -eq 'lan') { 'lan' }   # (the in-game menu's This network (LAN): runtime/gpu_menu.c net_load)
+           elseif (@($ServerRegions | ForEach-Object { $_.Lobby }) -contains $lobbyHost -or $lobbyHost -like 'smash.recomps.wtf*' -or $lobbyHost -like 'opensmash-lobby.duckdns.org*' -or @('auto', 'na', 'eu') -contains $lobbyHost) { if ($lobbyCode) { 'private' } else { 'public' } }
            else { 'custom' }
 
 try {
 [Windows.Forms.Application]::EnableVisualStyles()
 $form = New-Object Windows.Forms.Form
-$form.Text = 'WindowSmash'
+$form.Text = 'OpenSmash'
 $form.AutoScaleMode = [Windows.Forms.AutoScaleMode]::Dpi
 $form.AutoScaleDimensions = New-Object Drawing.SizeF(96, 96)
 $form.ClientSize = New-Object Drawing.Size(760, 574)
@@ -337,7 +345,7 @@ $form.FormBorderStyle = [Windows.Forms.FormBorderStyle]::FixedDialog
 $form.MaximizeBox = $false
 $form.StartPosition = [Windows.Forms.FormStartPosition]::CenterScreen
 $form.Font = New-Object Drawing.Font('Segoe UI', 9.75)
-$ico = Join-Path $Root 'docs\assets\windowsmash.ico'
+$ico = Join-Path $Root 'docs\assets\opensmash.ico'
 if (Test-Path -LiteralPath $ico) { $form.Icon = New-Object Drawing.Icon($ico) }
 $tips = New-Object Windows.Forms.ToolTip
 $tips.AutoPopDelay = 20000
@@ -463,6 +471,7 @@ $modeBox = New-Choice @(
     @{ Value = 'public'; Text = 'Public lobby' },
     @{ Value = 'private'; Text = 'Private lobby (a code)' },
     @{ Value = 'custom'; Text = 'Your own server' },
+    @{ Value = 'lan'; Text = 'This network (LAN)' },
     @{ Value = 'offline'; Text = 'Offline' }) $netMode $RC 118 $RW `
     "Public lobby: everyone's rooms in Local Wireless, and Online.`nPrivate lobby: only the players with the same code.`nYour own server: the host:port of a lobby you run (docs\MULTIPLAYER.md)."
 [void](New-Text 'Lobby code' $R 155 120)
@@ -470,8 +479,11 @@ $codeBox = New-TextBox $lobbyCode 32 $RC 152 $RW 'A word your friends type too, 
 [void](New-Text 'Server' $R 189 120)
 $serverBox = New-TextBox $(if ($netMode -eq 'custom') { $lobbyHost } else { '' }) 0 $RC 186 $RW 'host:port, e.g. 192.168.1.20:39420'
 $directBox = New-Check 'Direct connections' (-not ((Get-LineValue $directFile) -match '^(?i)off')) $R 222 344 `
-    "The players in your rooms connect to you directly, which is faster.`nOff: everything goes through the lobby, and they don't learn your internet address."
+    "Private rooms and This network (LAN) only: the players connect to each other directly, which is faster, and a room on this network is announced.`nThe official lobbies never connect players directly, whatever this says."
 $netNote = New-Text '' $R 250 344 34 -Dim
+# (config\server_region.txt as the game reads it: a region's id, anything else auto)
+$regionWord = ([string](Get-LineValue (Join-Path (Join-Path $Root 'config') 'server_region.txt'))).Trim() -split '[ \t]+' | Select-Object -First 1
+$regionNow = @($ServerRegions | Where-Object { $_.Id -eq $regionWord } | ForEach-Object { $_.Label }) + @('Auto: the closest') | Select-Object -First 1
 $updateNet = {
     $m = $modeBox.SelectedItem.Value
     $codeBox.Enabled = $m -eq 'private' -or $m -eq 'custom'
@@ -479,7 +491,7 @@ $updateNet = {
     $nameBox.Enabled = $m -ne 'offline'
     $directBox.Enabled = $m -ne 'offline'
     $netNote.Text = switch ($m) {
-        'public' { "The game joins $PublicLobby." }
+        'public' { "The game joins the official lobby of your server region ($regionNow)." }
         'private' { 'Only the players with the same code (same capitals too) see your rooms.' }
         'custom' { 'Your own lobby server; the code is optional.' }
         'offline' { 'The game does not go online.' }
@@ -502,7 +514,7 @@ $padsButton.Text = 'Open controllers.ini'
 [void](New-Text "Each controller is set up in the game: press Esc, or the controller's Home / PS / Xbox button, and go to Controllers." 196 396 548 40 -Dim)
 $padsButton.Add_Click({
     if (Test-Path -LiteralPath $padsIni) { Start-Process -FilePath 'notepad.exe' -ArgumentList "`"$padsIni`"" }
-    else { [void][Windows.Forms.MessageBox]::Show($form, "controllers.ini is written at the game's first start.", 'WindowSmash', 'OK', 'Information') }
+    else { [void][Windows.Forms.MessageBox]::Show($form, "controllers.ini is written at the game's first start.", 'OpenSmash', 'OK', 'Information') }
 })
 
 $sep = New-Object Windows.Forms.Label
@@ -534,6 +546,7 @@ function Get-WindowValues {
     $code = $codeBox.Text -replace '\s', ''
     $server = switch ($modeBox.SelectedItem.Value) {
         'offline' { 'off' }
+        'lan' { 'lan' }
         'public' { 'auto' }
         'private' { "$PublicLobby $code" }
         'custom' { $s = $serverBox.Text.Trim(); if (-not $s) { $s = '127.0.0.1:39420' }; if ($code) { "$s $code" } else { $s } }
@@ -586,16 +599,16 @@ $before = Get-WindowValues
 $script:played = $null
 $play.Add_Click({
     if ($modeBox.SelectedItem.Value -eq 'private' -and -not ($codeBox.Text -replace '\s', '')) {
-        [void][Windows.Forms.MessageBox]::Show($form, 'Type a lobby code: a word your friends type too.', 'WindowSmash', 'OK', 'Warning')
+        [void][Windows.Forms.MessageBox]::Show($form, 'Type a lobby code: a word your friends type too.', 'OpenSmash', 'OK', 'Warning')
         [void]$codeBox.Focus()
         return
     }
     if ($modeBox.SelectedItem.Value -eq 'custom' -and $serverBox.Text.Trim() -and $serverBox.Text.Trim() -notmatch '^\S+:\d+$') {
-        [void][Windows.Forms.MessageBox]::Show($form, 'Your own server is host:port, e.g. 192.168.1.20:39420.', 'WindowSmash', 'OK', 'Warning')
+        [void][Windows.Forms.MessageBox]::Show($form, 'Your own server is host:port, e.g. 192.168.1.20:39420.', 'OpenSmash', 'OK', 'Warning')
         return
     }
     try { Save-WindowValues $before (Get-WindowValues) } catch {
-        [void][Windows.Forms.MessageBox]::Show($form, "The settings could not be saved: $($_.Exception.Message)", 'WindowSmash', 'OK', 'Error')
+        [void][Windows.Forms.MessageBox]::Show($form, "The settings could not be saved: $($_.Exception.Message)", 'OpenSmash', 'OK', 'Error')
         return
     }
     $script:played = $true

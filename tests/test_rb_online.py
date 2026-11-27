@@ -45,7 +45,9 @@ class OnlineMatch(unittest.TestCase):
         self.assertIn('peers = net_recent_peers(seen, 8, 30000);', core, 'the other game: the one Pia talks to')
         self.assertIn('if (peers != 1)', core, 'more than 2 players: the game\'s own netcode')
         self.assertIn('int own = ld32(st + 0x78) == 0 && !ld8(st + 0x451) ? 0 : 1;', core, 'player 1 is the network player or this game')
-        self.assertIn('while (!hs_agreed && now_ms() - t0 < ONLINE_WAIT_MS)', core, 'a bounded wait for the other side')
+        self.assertIn('if (waited >= ONLINE_WAIT_MS) {', core, 'a bounded wait for the other side')
+        self.assertIn('if (heard > ONLINE_HEARD_MS || waited >= ONLINE_WAIT_MAX_MS) break;', core,
+                      'longer only while the other game is heard, and never past ONLINE_WAIT_MAX_MS')
         self.assertIn('online_forget("no rollback on the other side");', core)
         # each panel: this game's own on its number's slot, the network player a local one
         self.assertIn('slot = type == 0 && !ld8(st + 0x451) ? (u32)net_local : (u32)idx;', core)
@@ -57,7 +59,9 @@ class OnlineMatch(unittest.TestCase):
         self.assertIn('f_71017880c0_orig(c);', core, 'the game\'s own record built again from its panel')
         self.assertIn('memcpy(online_rec[idx], P(u8, rec), ONLINE_REC); online_rec_have[idx] = 1;', core)
         self.assertIn('online_restore();   /* (an Online match: the game\'s own set-up back for its results) */', core)
-        self.assertIn('memcpy(P(u8, MELEE_INFO), online_hdr, ONLINE_HDR);', core)
+        self.assertIn('if (all || (k != 9 && k != 0xa) || now == online_hdr_rb[k]) { st8(MELEE_INFO + k, online_hdr[k]); undone++; continue; }', core,
+                      'the header put back but for a sudden death: + 9 and + 0xa kept (Wuhu Island crashed at the results with + 0xa back to 0)')
+        self.assertIn('memcpy(online_hdr_rb, P(u8, MELEE_INFO), ONLINE_HDR); online_hdr_rb_have = 1;', core)
         # a Local Wireless room's match: its results on rollback's set-up, every player local (#180)
         self.assertIn('online_match = 1; online_lw = mode != ONLINE_MELEE && mode != ARENA_MELEE;', core,
                       'Quickplay and Battle Arena matches get the game set-up back; Local Wireless room matches do not')
@@ -102,7 +106,10 @@ class OnlineMatch(unittest.TestCase):
 
     def test_online_delay(self):
         core = src('hle_rb_core.c')
-        self.assertIn('net_delay = net_online ? rbn_online_delay_for_rtt(worst) : rbn_delay_for_rtt(worst);', core)
+        self.assertIn('net_delay = rbn_online_delay_for_rtt(worst);', core)   # (every mode, since 2026-11-24)
+        self.assertNotIn('rbn_delay_for_rtt(worst)', core)
+        # relay / host-join with no delay given measure it too (a fixed 2 waited every frame at 130 ms one way)
+        self.assertRegex(core, r'int ok;\s+net_delay = -1;[^\n]*\n(?:\s+\*[^\n]*\n)*\s+if \(net_online\) \{')
 
     def test_report(self):
         core = src('hle_rb_core.c')
@@ -120,8 +127,12 @@ class OnlineMatch(unittest.TestCase):
 
 class NexServer(unittest.TestCase):
     def test_close_reason_logged(self):
-        prudp = (ROOT / 'tools' / 'nex' / 'prudp.py').read_text(encoding='utf-8')
-        server = (ROOT / 'tools' / 'nex' / 'server.py').read_text(encoding='utf-8')
+        import sys
+        sys.path.insert(0, str(ROOT / 'tests'))
+        import netproto   # (tools/nex is the lobby server's: skipped without a checkout of it)
+        netproto.need_lobby()
+        prudp = (netproto.SERVER_DIR / 'tools' / 'nex' / 'prudp.py').read_text(encoding='utf-8')
+        server = (netproto.SERVER_DIR / 'tools' / 'nex' / 'server.py').read_text(encoding='utf-8')
         self.assertIn('c.why = why', prudp)
         self.assertIn('self.info(f"{self.name(conn)} left" + (f" ({why})" if why else ""))', server)
 

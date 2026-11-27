@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Starts the game as a netplay player joining a host's relay (or a standalone relay,
-# tools/ssbu_relay.py). No port forwarding needed here. See docs/MULTIPLAYER.md. The log goes to build/play.log.
+# Starts the game as a netplay player joining a host's relay (or an online lobby).
+# No port forwarding needed here. See docs/MULTIPLAYER.md. The log goes to build/play.log.
 here="$(dirname "$(readlink -f "$0")")"
-cd "${SSBU_GAME_DIR:-$here}" || exit 1   # (a WindowSmash folder built on Linux: see scripts/common.sh)
+cd "${SSBU_GAME_DIR:-$here}" || exit 1   # (an OpenSmash folder built on Linux: see scripts/common.sh)
 . "$here/scripts/common.sh"
 find_game_data || exit 1
 check_libraries || exit 1

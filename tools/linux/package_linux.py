@@ -77,7 +77,10 @@ def fonts_left_out(fonts, open_fonts):
 
 def shader_cache_version():
     with open(os.path.join(REPO, "runtime", "gpu_shader_cache.h"), encoding="utf-8") as f:
-        return int(re.search(r"#define SHADER_CACHE_VERSION (\d+)", f.read()).group(1))
+        text = f.read()
+    ver = int(re.search(r"#define SHADER_CACHE_VERSION (\d+)", text).group(1))
+    dxbc = re.search(r"#define SHADER_CACHE_DXBC_VERSION \(SHADER_CACHE_VERSION \* 100 \+ (\d+)\)", text)
+    return ver * 100 + int(dxbc.group(1)) if dxbc else ver
 
 
 # A cache file dated before 2002 is the ahead-of-time compiler's (tools/shader_aot.py), not yet used
@@ -201,7 +204,7 @@ def main():
         copy(os.path.join(REPO, "docs", doc), os.path.join(BUNDLE, "docs", doc))
     if os.path.exists(os.path.join(REPO, "online_server.txt")):
         copy(os.path.join(REPO, "online_server.txt"), os.path.join(BUNDLE, "online_server.txt"))
-    for tool in ("unlock_all.py", "ssbu_relay.py"):
+    for tool in ("unlock_all.py",):
         copy(os.path.join(REPO, "tools", tool), os.path.join(BUNDLE, "tools", tool))
     total = sum(os.path.getsize(os.path.join(r, f)) for r, _d, fs in os.walk(BUNDLE) for f in fs)
     print(f"{BUNDLE}: {PORT}'s game, {total / 2**30:.2f} GB ({copied / 2**20:,.0f} MB copied now); the game data "

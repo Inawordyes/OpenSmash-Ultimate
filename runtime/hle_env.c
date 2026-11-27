@@ -34,15 +34,18 @@ HLE(_ZN2nn2oe25TryPopNotificationMessageEPj) { c->x[0] = 0; }       /* no messag
 /* The game's language: SSBU_LANGUAGE, else display.ini's language (the settings menu writes it;
  * auto or missing: the system's), else the system's display language - Windows' user interface
  * language (not its regional format), or LANG / LC_ALL elsewhere. Asked once; logged once. */
-static u64 desired_language(void) {
-    static u64 code;
-    if (code) return code;
+static u64 desired_code;
+static const char *chosen_language;   /* the pick when SSBU_LANGUAGE or display.ini named a language the game has */
+static BOOL CALLBACK find_language(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+    (void)once; (void)param; (void)ctx;
     char name[96] = "", from[32] = "SSBU_LANGUAGE";
     const char *env = getenv("SSBU_LANGUAGE");
-    if (env && *env) snprintf(name, sizeof name, "%s", env);
+    int chosen = 1;
+    if (env && *env && _stricmp(env, "auto")) snprintf(name, sizeof name, "%s", env);
     else if (settings_ini_get(display_ini_path(), NULL, "language", name, sizeof name) && name[0] && _stricmp(name, "auto"))
         snprintf(from, sizeof from, "display.ini");
     else {
+        chosen = 0;
         name[0] = 0;
         snprintf(from, sizeof from, "the system");
 #ifdef _WIN32
@@ -60,8 +63,23 @@ static u64 desired_language(void) {
     u64 v = 0;
     memcpy(&v, pick, strlen(pick));
     fprintf(stderr, "[env] the game's language: %s (from %s, \"%s\")\n", pick, from, name);
-    code = v;
-    return v;
+    if (chosen && language_known(name)) chosen_language = pick;   /* (a typo is not a choice: the save keeps its own) */
+    desired_code = v;
+    return TRUE;
+}
+/* (asked by the game's thread and by the save's reader: worked out once, InitOnce) */
+static u64 desired_language(void) {
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&once, find_language, NULL, NULL);
+    return desired_code;
+}
+/* (hle_fs.c) The text language the game's system save should hold: the one the player chose
+ * (SSBU_LANGUAGE, or display.ini's language when it is not auto), as the save keeps it
+ * (language.h); -1 when none was chosen, and the save's own stays (as on the console). */
+int save_language_wanted(const char **code) {
+    desired_language();
+    if (code) *code = chosen_language;
+    return chosen_language ? language_save_value(chosen_language) : -1;
 }
 HLE(_ZN2nn2oe18GetDesiredLanguageEv) { c->x[0] = desired_language(); }   /* a LanguageCode, by value */
 HLE(_ZN2nn2oe25GetProgramTotalActiveTimeEv) { c->x[0] = rt_now_ns(); }
@@ -97,10 +115,13 @@ static void steady_point(u64 out) {   /* SteadyClockTimePoint: { s64 seconds; Uu
 
 /* CalendarTime { s16 year; s8 month, day, hour, minute, second; } and
  * CalendarAdditionalInfo { s32 day of week; s32 day of year; char zone[8]; s32 dst; s32 utc offset; } */
+int rb_net_fixed_clock(void);
 static void calendar(u64 out, u64 info, i64 posix) {
     time_t t = (time_t)posix;
     struct tm lt;
-    localtime_s(&lt, &t);
+    int utc = rb_net_fixed_clock();   /* (FIXCLOCK below: no time zone, the same calendar on every PC) */
+    if (utc) gmtime_s(&lt, &t);
+    else localtime_s(&lt, &t);
     st16(out, (u16)(lt.tm_year + 1900));
     st8(out + 2, (u8)(lt.tm_mon + 1)); st8(out + 3, (u8)lt.tm_mday);
     st8(out + 4, (u8)lt.tm_hour); st8(out + 5, (u8)lt.tm_min); st8(out + 6, (u8)lt.tm_sec); st8(out + 7, 0);
@@ -112,7 +133,7 @@ static void calendar(u64 out, u64 info, i64 posix) {
         st32(info + 4, (u32)lt.tm_yday);
         memcpy(P(void, info + 8), "LOCAL", 5);
         st32(info + 16, lt.tm_isdst > 0);
-        st32(info + 20, (u32)(-offset + (lt.tm_isdst > 0 ? 3600 : 0)));
+        st32(info + 20, utc ? 0u : (u32)(-offset + (lt.tm_isdst > 0 ? 3600 : 0)));
     }
 }
 
@@ -120,7 +141,16 @@ HLE(_ZN2nn4time10InitializeEv) { c->x[0] = 0; }
 HLE(_ZN2nn4time8FinalizeEv) { c->x[0] = 0; }
 HLE(_ZN2nn4time13IsInitializedEv) { c->x[0] = 1; }
 int test_fixed_clock(u64 lr);   /* (hle_fight_test.c) SSBU_FIXED_SEED: a clock read that seeds a generator */
-static u64 time_now(Cpu *c) { return test_fixed_clock(c->x[30]) ? FIXED_TIME : (u64)time(NULL); }
+/* (#181, SSBU Arena 7587eca's idea) FIXCLOCK: while this game is paired with others for online rollback
+ * (hle_rb_core.c rb_net_fixed_clock), every game reads the same time of day, in UTC: the real clock and time zone
+ * enter the simulation (Smashville's time of day: hour, minute, day), so two PCs with other clocks or zones went out
+ * of sync on that stage. SSBU_RB_FIXCLOCK=0: the real clock, as before. */
+int rb_net_fixed_clock(void);
+#define NET_FIXED_TIME (FIXED_TIME + 50400ull)   /* (a day's afternoon, the same on every PC) */
+static u64 time_now(Cpu *c) {
+    if (test_fixed_clock(c->x[30])) return FIXED_TIME;
+    return rb_net_fixed_clock() ? NET_FIXED_TIME : (u64)time(NULL);
+}
 HLE(_ZN2nn4time23StandardUserSystemClock14GetCurrentTimeEPNS0_9PosixTimeE) { st64(c->x[0], time_now(c)); c->x[0] = 0; }
 HLE(_ZN2nn4time26StandardNetworkSystemClock14GetCurrentTimeEPNS0_9PosixTimeE) { st64(c->x[0], time_now(c)); c->x[0] = 0; }
 /* The std::chrono-style clock: its time_point is the seconds alone, an 8-byte value returned in x0
@@ -150,7 +180,7 @@ HLE(_ZN2nn4time11ToPosixTimeEPiPNS0_9PosixTimeEiRKNS0_12CalendarTimeE) {   /* (c
  * network times, their calendar forms, a steady time point and the location name. */
 HLE(_ZN2nn4time13ClockSnapshot29CreateWithStandardSystemClockEPS1_) {
     u64 s = c->x[0];
-    i64 now = (i64)time(NULL), steady = steady_seconds();
+    i64 now = rb_net_fixed_clock() ? (i64)NET_FIXED_TIME : (i64)time(NULL), steady = steady_seconds();   /* (FIXCLOCK) */
     memset(P(void, s), 0, 0xD0);
     for (u64 ctx = s; ctx <= s + 0x20; ctx += 0x20) {
         st64(ctx, (u64)(now - steady));

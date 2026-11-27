@@ -43,6 +43,9 @@ static u32 game_nro_count;
 #define rt_nro_modules game_nros
 #define rt_nro_count game_nro_count
 #endif
+/* Told the faulting host module's file name (no folder) when the process crashes, before the report: gpu_vk.c's warm start
+ * notes a crash inside the graphics driver's shader compiler (#430). Called from the report's thread; NULL: nobody. */
+void (*rt_crash_module_hook)(const char *module);
 #define BOOT_MODULES 3
 #define MAX_MODULES 1024
 /* Loaded modules in load (and symbol search) order: the three the process starts with, then
@@ -418,10 +421,10 @@ static void cam_trace(Cpu *c, const u64 args[8], void *ctx) {
                stage_out_l, stage_out_r);
     }
     {
-        extern volatile long hud_calls[12];
+        extern volatile LONG hud_calls[12];
         char line[200];
         int n = snprintf(line, sizeof line, "[hudcalls] F %lld |", f);
-        for (int k = 0; k < 12; k++) n += snprintf(line + n, sizeof line - n, " %ld", InterlockedExchange(&hud_calls[k], 0));
+        for (int k = 0; k < 12; k++) n += snprintf(line + n, sizeof line - n, " %ld", (long)InterlockedExchange(&hud_calls[k], 0));
         printf("%s\n", line);
     }
     if (getenv("SSBU_DEBUG_CAM_TRACE_OBJ"))   /* (the render camera's start: its inputs) */
@@ -771,7 +774,7 @@ static u64 render_camera(void) {
     if (!a || !(a = *P(u64, a + 0x490))) return 0;
     return *P(u64, a + 0xd8) ? *P(u64, a + 0xe0) : 0x7105334060ull;
 }
-volatile long hud_calls[12];   /* (SSBU_DEBUG_CAM_TRACE: calls of each HUD world-to-screen function) */
+volatile LONG hud_calls[12];   /* (SSBU_DEBUG_CAM_TRACE: calls of each HUD world-to-screen function) */
 static void hud_call(int k, Cpu *c) {
     InterlockedIncrement(&hud_calls[k]);
     if (!aspect_native()) { hud_orig[k](c); return; }   /* (16:9: the game's own, untouched) */
@@ -1007,8 +1010,9 @@ static void pane_place(Cpu *c) {
             fflush(stdout);   /* (a test run is stopped, not ended: an unflushed line is lost) */
         }
     }
-    if (getenv("SSBU_DEBUG_PANES")) {   /* SSBU_DEBUG_PANES=<text> (HUD research): the panes whose name, or a parent's, holds it */
-        const char *want = getenv("SSBU_DEBUG_PANES");
+    static const char *want = (const char *)-1;   /* SSBU_DEBUG_PANES=<text> (HUD research): the panes whose name, or a parent's, holds it */
+    if (want == (const char *)-1) want = getenv("SSBU_DEBUG_PANES");   /* (read once: this runs for every pane, every game, every frame) */
+    if (want) {
         u64 q = pane; int under = 0;
         for (int d = 0; q && d < 10; d++, q = *P(u64, q + 0x18)) if (strstr(P(char, q + 0xb0), want)) under = 1;
         static u64 t, burst;
@@ -1159,6 +1163,7 @@ static _Noreturn void crash_report(EXCEPTION_POINTERS *e, DWORD tid) {
     if (thread && FAILED(GetThreadDescription(thread, &desc))) desc = NULL;
     out("host pc %#llx: %s +%#llx (thread %lu%s%ls)\n", pc, strrchr(modname, '\\') ? strrchr(modname, '\\') + 1 : modname,
         pc - (u64)mod, tid, desc && desc[0] ? ", " : "", desc && desc[0] ? desc : L"");
+    if (rt_crash_module_hook) rt_crash_module_hook(strrchr(modname, '\\') ? strrchr(modname, '\\') + 1 : modname);
     if (desc) LocalFree(desc);
     if (thread) CloseHandle(thread);
     {   /* (r22_1: the registers, and the stack's words either side of the stack pointer: a return through a wrong stack pointer shows there) */
@@ -2178,7 +2183,7 @@ static DWORD WINAPI status_thread(LPVOID unused) {
  * files than macOS's 256 by default (the game's own, RomFS sources, sockets), and what a start
  * from Finder or `open` needs - no terminal and / as the working folder: SSBU_LOG=<file> takes
  * stdout and stderr, SSBU_CWD=<dir> the working folder. Run as the app
- * (<tree>/build-mac/WindowSmash.app/Contents/MacOS/ssbu) with no directory given, the tree's
+ * (<tree>/build-mac/OpenSmash.app/Contents/MacOS/ssbu) with no directory given, the tree's
  * dump/modules is the one, and (without SSBU_CWD) the port's root - the nearest folder up from
  * the tree with tools/recomp.py - the working folder, where reports/ goes as everywhere. *dir
  * and *options: the directory, and where options start. */
@@ -2241,11 +2246,11 @@ static void mac_start(int argc, char **argv, const char **dir, int *options) {
 /* The game library cannot be used: why (detail, for the log), and what a player does about it. */
 static int game_refused(int quiet, const char *path, const char *detail) {
     static const char text[] =
-        "This WindowSmash's game library (" RT_GAME_LIBRARY ") is missing, or was built for another version of "
-        "WindowSmash. Run OpenSmash.exe again: it builds the game for this version.";
+        "This OpenSmash's game library (" RT_GAME_LIBRARY ") is missing, or was built for another version of "
+        "OpenSmash. Run OpenSmash.exe again: it builds the game for this version.";
     fprintf(stderr, "[boot] cannot use the game library %s: %s\n%s\n", path, detail, text);
 #ifdef _WIN32
-    if (!quiet) MessageBoxA(NULL, text, "WindowSmash", MB_OK | MB_ICONERROR);
+    if (!quiet) MessageBoxA(NULL, text, "OpenSmash", MB_OK | MB_ICONERROR);
 #else
     (void)quiet;
 #endif
@@ -2368,13 +2373,13 @@ static int game_version_ok(void) {
     const char *id = rt_module_main.build_id;
     if (id && !_stricmp(id, REQUIRED_MAIN_BUILD)) return 1;
     static const char text[] =
-        "This WindowSmash was built from another version of the game, and WindowSmash needs version "
+        "This OpenSmash was built from another version of the game, and OpenSmash needs version "
         REQUIRED_VERSION ". Put the game's " REQUIRED_VERSION " update (an .nsp file) in your game folder, next to the "
         "game, and run OpenSmash.exe again: it sets this folder up again, keeping your save and settings.";
     fprintf(stderr, "[boot] the game's main module is %s, not %s's (%s)\n%s\n", id ? id : "unknown",
             REQUIRED_VERSION, REQUIRED_MAIN_BUILD, text);
 #ifdef _WIN32
-    MessageBoxA(NULL, text, "WindowSmash", MB_OK | MB_ICONERROR);
+    MessageBoxA(NULL, text, "OpenSmash", MB_OK | MB_ICONERROR);
 #endif
     return 0;
 }
@@ -2482,10 +2487,6 @@ int main(int argc, char **argv) {
     mods_start(dir);
     void discord_start(void);   /* (net_discord.c: Discord's sign-in and Rich Presence, when its SDK is beside the program) */
     discord_start();
-#ifdef _WIN32
-    void net_eos_prestart(void);   /* (net_relay.c: Epic Online Services log in while the game loads, when online play wants them) */
-    net_eos_prestart();
-#endif
     kernel_init();
     load(dir);
     void mod_refresh_init(void);

@@ -21,14 +21,14 @@ deps\\msvc  Microsoft's C runtime (the static one the game links: libcmt, libvcr
            accept Microsoft's license terms (the Visual Studio Build Tools', at the address the list
            gives; only the list itself is read before that). The SDK's .msi files are unpacked with
            msiexec /a, an administrative install: files only, no administrator rights, nothing
-           registered with Windows. WindowSmash does not include any of these files.
+           registered with Windows. OpenSmash does not include any of these files.
 Neither needs administrator rights. Each folder's windowsmash.json says what it holds: versions,
 where from, download and unpacked sizes; it is written last, so a folder without it is unfinished
 and cc.py does not use it. Downloads go to deps\\downloads and are deleted afterwards: LLVM's
 archive and Microsoft's packages at the same time, those DOWNLOAD_JOBS files at a time.
 
 The setup is part of the build: OpenSmash.exe runs this (step 4) when no compiler works,
-and tools/build_game.py (launchers\\Build WindowSmash.bat) asks agree() at its first step and runs
+and tools/build_game.py (what OpenSmash.exe runs to build) asks agree() at its first step and runs
 install() in the background while it prepares the game files.
 
 Exit status: 0 done, 1 failed, 2 Microsoft's license was declined (nothing was downloaded).
@@ -59,7 +59,7 @@ LLVM_DIR = os.path.join(DEPS, "llvm")
 MSVC_DIR = os.path.join(DEPS, "msvc")
 DOWNLOADS = os.path.join(DEPS, "downloads")
 RECORD = "windowsmash.json"   # in each folder, written last (cc.py reads it too)
-USER_AGENT = "WindowSmash-msvc-deps"
+USER_AGENT = "OpenSmash-msvc-deps"
 DOWNLOAD_JOBS = 6
 
 # ---- LLVM: one pinned release ------------------------------------------------------------------
@@ -104,7 +104,7 @@ NEEDED_HEADERS = ("include/vcruntime.h", "include/stdarg.h")
 NEEDED_SDK_HEADERS = ("ucrt/stdio.h", "um/windows.h", "um/d3d11.h", "um/d3dcompiler.h", "shared/dxgi.h", "um/winsock2.h")
 
 LICENSE_NOTICE = """\
-Microsoft's C runtime and Windows SDK are Microsoft's software. WindowSmash does not include them:
+Microsoft's C runtime and Windows SDK are Microsoft's software. OpenSmash does not include them:
 it downloads them from Microsoft's servers onto this PC, to build the game here, and only if you
 accept Microsoft's license terms for them (those of the Visual Studio Build Tools):
     {url}
@@ -428,6 +428,51 @@ def read_record(folder):
         return None
 
 
+def repair_crt_libs(log=log):
+    """The DLL C runtime's import libraries (msvcrt.lib, msvcprt.lib, vcruntime.lib) into deps\\msvc's
+    toolset when the folder was set up by a version of this script from before they were kept: the game
+    links without them, but ssbu_glslang.dll (tools/glslang_lib.py, /MD) does not. Only what is missing is
+    fetched, from the same Microsoft package the install used. Returns the libraries put there; [] when
+    there is nothing to do (or no deps\\msvc to repair). Raises Failed when Microsoft's packages cannot be
+    read."""
+    record = read_record(MSVC_DIR)
+    if not record or not record.get("msvc"):
+        return []
+    toolset = record["msvc"]                       # ("14.51.36231")
+    libs_dir = os.path.join(MSVC_DIR, "VC", "Tools", "MSVC", toolset, "lib", "x64")
+    want = [n for n in ("msvcrt.lib", "msvcprt.lib", "vcruntime.lib") if not os.path.isfile(os.path.join(libs_dir, n))]
+    if not want:
+        return []
+    log(f"  deps\\msvc has no {', '.join(want)} (it was set up before they were kept): fetching them")
+    channel = read_channel()
+    packages = index_packages(fetch_json(channel["manifest"]["url"]))
+    # (the Store package has the DLL C runtime's import libraries at lib/x64; the desktop one has the static runtime)
+    name = "Microsoft.VC.%s.CRT.x64.Store.base" % ".".join(toolset.split(".")[:2])
+    p = package(packages, name)
+    if not p or not p.get("payloads"):
+        raise Failed(f"Microsoft's manifest has no {name}.")
+    payload = p["payloads"][0]
+    work = tempfile.mkdtemp(prefix="opensmash-crt-")
+    try:
+        archive = os.path.join(work, payload_name(payload))
+        download(payload["url"], archive, payload.get("sha256"), payload.get("size"), payload_name(payload))
+        got = []
+        with zipfile.ZipFile(archive) as z:
+            entries = {n.replace("\\", "/").lower(): n for n in z.namelist()}
+            for lib in want:
+                hit = [n for low, n in entries.items() if low.endswith("/lib/x64/" + lib)]
+                if not hit:
+                    raise Failed(f"the {name} package has no {lib}.")
+                os.makedirs(libs_dir, exist_ok=True)
+                with z.open(hit[0]) as src, open(os.path.join(libs_dir, lib), "wb") as f:
+                    shutil.copyfileobj(src, f, 1 << 20)
+                got.append(lib)
+        log(f"  deps\\msvc: {', '.join(got)}")
+        return got
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def write_record(folder, record):
     with open(os.path.join(folder, RECORD), "w", encoding="utf-8") as f:
         json.dump(record, f, indent=1)
@@ -619,8 +664,8 @@ def install_msvc(channel, keep_downloads=False):
     files = [{"file": payload_name(p), "url": p["url"], "size": p.get("size"), "sha256": p.get("sha256")} for p in first + cabs]
     folder = unpack_vsix([local(p) for p in vc], partial)
     # (into a short folder: the SDK's deepest files are over 100 characters below it, and msiexec
-    # cannot write past Windows' 260-character path limit, which a deep WindowSmash folder reaches)
-    unpacked = tempfile.mkdtemp(prefix="windowsmash-sdk-")
+    # cannot write past Windows' 260-character path limit, which a deep OpenSmash folder reaches)
+    unpacked = tempfile.mkdtemp(prefix="opensmash-sdk-")
     log("  unpacking them (msiexec /a: files only)")
     try:
         for p in msis:
@@ -744,7 +789,7 @@ def status():
             log(f"{name}: not set up" + (" (unfinished)" if os.path.isdir(folder) else ""))
         elif folder == LLVM_DIR:
             log(f"{name}: LLVM {r['version']}, {r['disk_bytes'] / 1e6:.0f} MB on disk, {r['download_bytes'] / 1e6:.0f} MB downloaded"
-                + ("" if r["version"] == LLVM_VERSION else f" (this version of WindowSmash takes {LLVM_VERSION})"))
+                + ("" if r["version"] == LLVM_VERSION else f" (this version of OpenSmash takes {LLVM_VERSION})"))
         else:
             log(f"{name}: MSVC {r['msvc']}, Windows SDK {r['sdk']} (Visual Studio {r['visual_studio']}), "
                 f"{r['disk_bytes'] / 1e6:.0f} MB on disk, {r['download_bytes'] / 1e6:.0f} MB downloaded; license {r['license']}")

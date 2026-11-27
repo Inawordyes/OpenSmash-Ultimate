@@ -38,11 +38,13 @@ uint32_t rbn_take_mismatch(void);                      /* the earliest frame run
 void rbn_put_mismatch(uint32_t frame);                 /* (a rollback that could not be done now: again next time) */
 uint32_t rbn_confirmed(void);                          /* the newest frame every player's real pad is known for */
 /* may the game run `frame` now? Not when it would put a guess further back than RBN_MAX_BACK */
+int rbn_max_back(void);   /* the furthest a rollback goes (RBN_MAX_BACK, or SSBU_RB_MAXBACK); the state ring is sized from it */
 int rbn_can_run(uint32_t frame);
 /* (v0.9.2) player p is gone from the fight after frame `after` (the same cutoff on every game: its LEFT, or the host's
  * word): its pads past it are none, nothing waits for them, and frames already run past it with other pads run again */
 void rbn_gone(int p, uint32_t after, uint32_t ran);   /* (ran: the newest frame this game has run) */
-uint32_t rbn_gone_after(int p);                        /* 0: not gone */
+uint32_t rbn_gone_after(int p);                        /* 0: not gone (1 also for a cutoff of 0: gone before its first pad) */
+int rbn_gone_known(int p);                             /* gone, and every pad of it known (real up to the cutoff, none after) */
 
 /* ---- the wire (little-endian, lengths checked) ----
  * PADS: type 1 | player u8 | count u8 | runs u8 (bit 7: behind, version 14) | first u32 | frame u32 | check_frame u32 | check u32 |
@@ -134,10 +136,10 @@ typedef struct RbnReady { int player, all; } RbnReady;
 size_t rbn_ready_build(uint8_t *buf, size_t cap, const RbnReady *r);
 /* MENU (the results screen): a player's A and B as they are now, from its game, every frame while the results show; the
  * other games press them for that player, so its card shows ready on every PC. type 6 | player u8 | buttons u8 (1 A,
- * 2 B) | 0 u8. */
+ * 2 B) | done u8 (1: its A counted for the skip, #389 - sent on from then on; older builds send 0 and ignore it). */
 enum { RBN_MSG_MENU = 6 };
 #define RBN_MENU_BYTES 4
-typedef struct RbnMenu { int player, buttons; } RbnMenu;
+typedef struct RbnMenu { int player, buttons, done; } RbnMenu;
 size_t rbn_menu_build(uint8_t *buf, size_t cap, const RbnMenu *m);
 int rbn_menu_parse(const uint8_t *buf, size_t len, RbnMenu *m);
 /* LEFT (v0.9): a game's fight is over (or it gave up on it): its last logic frame, so the others stop waiting for pads

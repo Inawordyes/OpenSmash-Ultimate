@@ -6,6 +6,7 @@ files, no network, no browser. Runs on Windows, Linux and macOS."""
 import http.client
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -41,15 +42,15 @@ class Settings(unittest.TestCase):
         s = launcher.read_settings(self.root)
         self.assertEqual(s["window"], "windowed")
         self.assertEqual(s["window_size"], "1280x720")
-        self.assertEqual(s["lobby"], "offline")   # (no online_server.txt: nothing to join)
+        self.assertEqual(s["lobby"], "public")   # (no online_server.txt: the official lobby, the launchers' default)
         self.assertEqual(s["name"], "")
-        self.assertEqual(s["direct"], "on")
+        self.assertEqual(s["direct"], "off")   # (the official lobby is relay only)
 
     def test_reads_the_files_the_game_and_windows_launcher_write(self):
         with open(os.path.join(self.root, "display.ini"), "w") as f:
             f.write("; the game's\nwindow = fullscreen   ; a comment\nwidth = 1920\nheight = 1080\nvolume=40\n")
         with open(os.path.join(self.root, "online_server.txt"), "w") as f:
-            f.write("# the lobby\nopensmash-lobby.duckdns.org:39421 friends\n")
+            f.write("# the lobby\neu.lobby.opensmashultimate.com:39421 friends\n")
         with open(os.path.join(self.root, "online_name.txt"), "w") as f:
             f.write("Mario\n")
         s = launcher.read_settings(self.root)
@@ -69,6 +70,33 @@ class Settings(unittest.TestCase):
             s = launcher.read_settings(self.root)
             self.assertEqual((s["lobby"], s["code"]), want, line)
 
+    def test_server_region(self):
+        import server_region
+        for line in ("na.lobby.opensmashultimate.com:39421\n", "eu.lobby.opensmashultimate.com:39421 abc\n"):   # (a region's lobby: the official one)
+            with open(os.path.join(self.root, "online_server.txt"), "w") as f:
+                f.write(line)
+            self.assertEqual(launcher.read_settings(self.root)["lobby"], "private" if "abc" in line else "public", line)
+        os.remove(os.path.join(self.root, "online_server.txt"))
+        s = launcher.read_settings(self.root)
+        self.assertEqual((s["region"], s["region_shown"]), ("eu", ""))   # (no file, nothing measured: Europe)
+        self.assertEqual(launcher.CHOICES["region"], [("eu", "Europe"), ("na-east", "North America East"), ("sa", "South America")])   # (our regions only)
+        s = launcher.write_settings(self.root, {"region": "na-east"})
+        self.assertEqual((s["region"], s["region_shown"]), ("na-east", ""))
+        self.assertEqual(launcher.first_line(os.path.join(self.root, "config", "server_region.txt")), "na-east")
+        self.assertEqual(server_region.official_lobby(self.root), "na.lobby.opensmashultimate.com:39421")
+        launcher.write_settings(self.root, {"window": "borderless"})   # (another setting: the region stays)
+        self.assertEqual(launcher.read_settings(self.root)["region"], "na-east")
+        with self.assertRaises(launcher.Error):
+            launcher.write_settings(self.root, {"region": "moon"})
+        with self.assertRaises(launcher.Error):
+            launcher.write_settings(self.root, {"region": "auto"})   # (no longer a choice of the page)
+        server_region.set_setting(self.root, "auto")   # (the game's own default in the file: shown as the region it plays on)
+        with open(os.path.join(self.root, "config", "server_region_auto.txt"), "w") as f:
+            f.write("na-east 24 1700000000\n")
+        self.assertEqual(launcher.read_settings(self.root)["region"], "na-east")
+        s = launcher.write_settings(self.root, {"region": "eu"})
+        self.assertEqual((s["region"], server_region.official_lobby(self.root)), ("eu", "eu.lobby.opensmashultimate.com:39421"))
+
     def test_an_old_saved_custom_lobby_is_not_written_back(self):
         # (issue #389: launcher.ini's lobby = custom with the gone North American lobby put it back into online_server.txt)
         with open(os.path.join(self.root, "online_server.txt"), "w") as f:
@@ -79,14 +107,16 @@ class Settings(unittest.TestCase):
         self.assertEqual((s["lobby"], s["server"]), ("public", ""))
         launcher.write_settings(self.root, {})
         self.assertEqual(launcher.first_line(os.path.join(self.root, "online_server.txt")), "auto")
-        launcher.write_settings(self.root, {"lobby": "custom", "server": "opensmash-lobby.duckdns.org:39421", "code": "abc"})
-        self.assertEqual(launcher.first_line(os.path.join(self.root, "online_server.txt")), "opensmash-lobby.duckdns.org:39421 abc")
+        # (an official lobby's address, or an older public lobby's, typed as "Your own server": the private lobby)
+        for typed in ("opensmash-lobby.duckdns.org:39421", "na.lobby.opensmashultimate.com:39421"):
+            launcher.write_settings(self.root, {"lobby": "custom", "server": typed, "code": "abc"})
+            self.assertEqual(launcher.first_line(os.path.join(self.root, "online_server.txt")), launcher.PUBLIC_LOBBY + " abc")
 
     def test_write_each_lobby(self):
         for lobby, extra, line in (("public", {}, "auto"), ("offline", {}, "off"),
-                                   ("private", {"code": "abc"}, "opensmash-lobby.duckdns.org:39421 abc"),
+                                   ("private", {"code": "abc"}, "eu.lobby.opensmashultimate.com:39421 abc"),
                                    ("custom", {"server": "10.0.0.2:39420", "code": ""}, "10.0.0.2:39420"),
-                                   ("custom", {"server": "", "code": "x"}, "127.0.0.1:39420 x")):
+                                   ("custom", {"server": "10.0.0.2:39420", "code": "x"}, "10.0.0.2:39420 x")):
             launcher.write_settings(self.root, {"lobby": lobby, **extra})
             self.assertEqual(launcher.first_line(os.path.join(self.root, "online_server.txt")), line, lobby)
             self.assertEqual(launcher.ini_value(os.path.join(self.root, "launcher.ini"), "opensmash", "lobby"), lobby)
@@ -112,6 +142,37 @@ class Settings(unittest.TestCase):
         self.assertEqual(launcher.ini_value(pads, "general", "keyboard_player"), "0")
         self.assertEqual(launcher.ini_value(pads, "pad1", "button_a"), "0")
 
+    def test_online_rules(self):
+        """OpenSmash.Core/OnlineSettings.cs' rules: the official lobby hides AND resets the code, the server of one's own and
+        Direct connections (off), launcher.ini's remembered copy too; a server of one's own shows them again, empty, with
+        Direct connections back on; nothing half-typed is written; leftovers of old files are not shown."""
+        server, direct, ini = (os.path.join(self.root, n) for n in ("online_server.txt", "online_direct.txt", "launcher.ini"))
+        with open(server, "w") as f:
+            f.write("auto\n")
+        with open(direct, "w") as f:
+            f.write("on\n")
+        with open(ini, "w") as f:
+            f.write("[opensmash]\ncode = oldcode\nserver = my.host:39420\n")
+        s = launcher.read_settings(self.root)
+        self.assertEqual((s["lobby"], s["code"], s["server"], s["direct"]), ("public", "", "", "off"))
+        self.assertEqual(text(direct), "on\n")   # (reading writes nothing)
+        with self.assertRaises(launcher.Error):   # (your own server without its address: refused, nothing made up)
+            launcher.write_settings(self.root, {"lobby": "custom"})
+        self.assertEqual(launcher.first_line(server), "auto")
+        s = launcher.write_settings(self.root, {"lobby": "custom", "server": "my.host:39420", "code": "abc"})
+        self.assertEqual((launcher.first_line(server), s["direct"], launcher.first_line(direct)), ("my.host:39420 abc", "on", "on"))
+        s = launcher.write_settings(self.root, {"lobby": "public"})
+        self.assertEqual((launcher.first_line(server), s["code"], s["server"], launcher.first_line(direct)), ("auto", "", "", "off"))
+        self.assertEqual((launcher.ini_value(ini, "opensmash", "code"), launcher.ini_value(ini, "opensmash", "server")), ("", ""))
+        s = launcher.write_settings(self.root, {"lobby": "lan"})
+        self.assertEqual((launcher.first_line(server), launcher.first_line(direct)), ("lan", "on"))
+        s = launcher.write_settings(self.root, {"lobby": "private", "code": "fr1"})
+        self.assertEqual((launcher.first_line(server), s["server"], launcher.first_line(direct)), (launcher.PUBLIC_LOBBY + " fr1", "", "off"))
+        os.remove(server)
+        self.assertTrue(launcher.ensure_official_line(self.root))
+        self.assertEqual(launcher.first_line(server), "auto")
+        self.assertFalse(launcher.ensure_official_line(self.root))
+
     def test_refuses_what_the_windows_launcher_refuses(self):
         with self.assertRaises(launcher.Error):
             launcher.write_settings(self.root, {"lobby": "private", "code": ""})
@@ -121,6 +182,46 @@ class Settings(unittest.TestCase):
             launcher.write_settings(self.root, {"window": "huge"})
         with self.assertRaises(launcher.Error):
             launcher.write_settings(self.root, {"window_size": "big"})
+
+    def test_writes_only_what_the_page_changed(self):
+        # (one source of truth with the game's settings menu, Esc: what it saved while the page was open stays)
+        launcher.write_settings(self.root, {})
+        self.assertEqual(os.listdir(self.root), [], "nothing changed: no file written")
+        display = os.path.join(self.root, "display.ini")
+        with open(display, "w", newline="") as f:
+            f.write("; the game's\r\nwindow = borderless   ; mine\r\nshow_advanced = 1\r\n")
+        launcher.write_settings(self.root, {"volume": "50"})
+        with open(display, newline="") as f:
+            self.assertEqual(f.read(), "; the game's\r\nwindow = borderless   ; mine\r\nshow_advanced = 1\r\nvolume = 50\r\n")
+        launcher.write_settings(self.root, {"window": "fullscreen"})
+        with open(display, newline="") as f:
+            self.assertEqual(f.read(), "; the game's\r\nwindow = fullscreen   ; mine\r\nshow_advanced = 1\r\nvolume = 50\r\n",
+                             "changed in place, its comment and line ends kept")
+        self.assertFalse(os.path.exists(os.path.join(self.root, "online_server.txt")), "no lobby change: online_server.txt not written")
+        os.utime(display, (1000000, 1000000))
+        launcher.write_settings(self.root, {"window": "fullscreen"})
+        self.assertEqual(os.path.getmtime(display), 1000000, "the same value: the file is not written again")
+
+    def test_lobby_lines_as_the_game_reads_them(self):
+        # (runtime/gpu_menu.c net_load / net_save_server; the same table as tests/launcher_settings' Lobby)
+        pub = launcher.PUBLIC_LOBBY
+        for line, lobby, back in (("", "public", "auto"), ("off", "offline", "off"), ("auto", "public", "auto"),
+                                  ("na", "public", "auto"), ("eos", "public", "auto"), ("lan", "lan", "lan"), (pub, "public", "auto"),
+                                  (pub + " friends", "private", pub + " friends"), ("auto abc", "private", pub + " abc"),
+                                  ("10.0.0.2:39420 abc", "custom", "10.0.0.2:39420 abc")):
+            with open(os.path.join(self.root, "online_server.txt"), "w") as f:
+                f.write(line + "\n")
+            s = launcher.read_settings(self.root)
+            self.assertEqual(s["lobby"], lobby, line)
+            launcher.write_settings(self.root, {"lobby": s["lobby"]})
+            self.assertEqual(launcher.first_line(os.path.join(self.root, "online_server.txt")), back, line)
+
+    def test_renderer_as_the_game_starts_it(self):
+        # (#429: an older launcher's renderer = d3d11 keeps the in-game menu's renderer_menu)
+        self.assertEqual(launcher.renderer_shown("d3d11", "vulkan"), "vulkan")
+        self.assertEqual(launcher.renderer_shown("d3d11", None), "auto")
+        self.assertEqual(launcher.renderer_shown("direct3d11", "vulkan"), "direct3d11")
+        self.assertEqual(launcher.renderer_shown("vk", ""), "vulkan")
 
     def test_config_folder_once_the_game_made_it(self):
         os.makedirs(os.path.join(self.root, "config"))
@@ -181,6 +282,66 @@ class Commands(unittest.TestCase):
         self.assertEqual(launcher.play_command("/r", "offline", "macos")[-1], "offline")
         for path in ("play-ssbu.sh", os.path.join("launchers", "play-ssbu-offline.sh"), os.path.join("tools", "mac", "launch.sh")):
             self.assertTrue(os.path.isfile(os.path.join(ROOT, path)), path)
+
+    def test_online_pass(self):
+        """(v0.5.0) the official lobbies need a signed-in launcher's ticket: named to the game while it is good, else
+        a clear "sign in with the OpenSmash launcher"; other lobbies need none."""
+        now = 1700000000
+        self.assertEqual(launcher.online_pass(self.root, {"lobby": "lan"}, now), ({}, ""))
+        self.assertEqual(launcher.online_pass(self.root, {"lobby": "custom"}, now), ({}, ""))
+        env, say = launcher.online_pass(self.root, {"lobby": "public"}, now)
+        self.assertEqual(env, {})
+        self.assertIn("Sign in with the OpenSmash launcher", say)
+        path = os.path.join(self.root, "build", "cache", "online_pass.txt")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w", encoding="ascii") as f:
+            f.write("u|Ann|%d|%d.%s\n" % (now + 3600, now, "f" * 64))
+        for lobby in ("public", "private"):
+            self.assertEqual(launcher.online_pass(self.root, {"lobby": lobby}, now), ({"SSBU_ONLINE_TICKET_FILE": path}, ""))
+        env, say = launcher.online_pass(self.root, {"lobby": "public"}, now + 3600 - 30)   # (about to expire: not used)
+        self.assertEqual(env, {})
+        self.assertTrue(say)
+        with open(path, "w", encoding="ascii") as f:   # (a ticket of 10 minutes, as tools/dev/fake_accounts.py makes: used)
+            f.write("u|Ann|%d.%s\n" % (now + 600, "f" * 64))
+        self.assertEqual(launcher.online_pass(self.root, {"lobby": "public"}, now)[0], {"SSBU_ONLINE_TICKET_FILE": path})
+
+    def test_online_pass_asks_the_launcher(self):
+        """At Play the web launcher asks the OpenSmash launcher (no window: --online-pass) for a fresh ticket when the one
+        left is missing or about to expire, so a player signed in there plays here too; never when there is no launcher
+        program or the ticket is good."""
+        path = os.path.join(self.root, "build", "cache", "online_pass.txt")
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="ascii") as f:
+                f.write("u|Ann|%d.%s\n" % (int(time.time()) + 28800, "f" * 64))
+            return subprocess.CompletedProcess(cmd, 0, "online pass: written for Ann#0001\n", "")
+
+        self.assertEqual(launcher.renew_pass(self.root, "macos", run), "")   # (no launcher program here: not asked)
+        self.assertEqual(calls, [])
+        program = os.path.join(self.root, "OpenSmash.Avalonia.app", "Contents", "MacOS", "OpenSmash.Avalonia")
+        os.makedirs(os.path.dirname(program))
+        with open(program, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(program, 0o755)
+        if not os.access(program, os.X_OK):
+            self.skipTest("no executable bit here")
+        self.assertEqual(launcher.launcher_program(self.root, "macos"), program)
+        self.assertEqual(launcher.renew_pass(self.root, "macos", run), "online pass: written for Ann#0001")
+        self.assertEqual(calls, [[program, "--online-pass", "--project", self.root]])
+        self.assertEqual(launcher.renew_pass(self.root, "macos", run), "")   # (a good ticket now: not asked again)
+        self.assertEqual(len(calls), 1)
+        with open(path, "w", encoding="ascii") as f:                         # (about to expire: asked)
+            f.write("u|Ann|%d.%s\n" % (int(time.time()) + 120, "f" * 64))
+        launcher.renew_pass(self.root, "macos", run)
+        self.assertEqual(len(calls), 2)
+
+        def broken(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, 15)
+        os.remove(path)
+        self.assertIn("did not answer", launcher.renew_pass(self.root, "macos", broken))
 
     def test_programs(self):
         self.assertTrue(launcher.game_program("/r", "linux").endswith(os.path.join("build-linux", "ssbu")))
@@ -312,7 +473,7 @@ class Server(unittest.TestCase):
         self.assertFalse(s["built"])
         self.assertFalse(s["python"])
         self.assertIn("window", s["choices"])
-        self.assertEqual(s["settings"]["lobby"], "offline")
+        self.assertEqual(s["settings"]["lobby"], "public")   # (no lobby line: the official lobby)
 
     def test_settings_round_trip_and_error(self):
         status, s = self.call("POST", "/api/settings", {"lobby": "private", "code": "duck", "name": "Kirby"})

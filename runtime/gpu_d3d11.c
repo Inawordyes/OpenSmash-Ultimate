@@ -67,6 +67,7 @@ static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
 static int ready;
 
 u64 gfx_stat_clears, gfx_stat_presented;
+static u64 gfx_stat_standin_draws, gfx_stat_mixed_left;   /* (mixed_targets) */
 
 /* ---- surfaces: render targets on the host ------------------------------------------- */
 /* Render scale (display.ini render_scale): every render target is made this many times the
@@ -449,6 +450,22 @@ static void warm_start(void);
 #ifdef _WIN32
 #define WARM_GAME "Local\\ssbu-game-running"
 static HANDLE game_mutex;                          /* (WARM_GAME) held while the game runs: ssbu --warm-shaders pauses for it */
+#else
+/* (Linux) WARM_GAME's counterpart: <shader cache>/game.lock, which every game holds shared (flock) while it
+ * runs. Prepare Shaders (tools/shader_aot.py game_running) pauses its compile for it, and the warm pass (ssbu
+ * --warm-shaders, below) stops for it. Without it both went on at full pace beside the game: the Linux launcher
+ * starts Prepare Shaders by itself since #589, and a Steam Deck's 4 cores and shared power were left to the
+ * compile in the menus and the first matches. */
+#define WARM_GAME_LOCK "game.lock"
+static const char *cache_dir(void);
+static void game_lock_take(void) {
+    static int fd = -1;   /* (kept open for the process's life: the lock goes with it) */
+    if (fd >= 0) return;
+    char path[1100];
+    snprintf(path, sizeof path, "%s/" WARM_GAME_LOCK, cache_dir());
+    fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd >= 0 && flock(fd, LOCK_SH)) { close(fd); fd = -1; }
+}
 #endif
 
 /* Direct3D 11 is DXVK's: always on Linux; on Windows when d3d11.dll is not the system's (the
@@ -545,6 +562,8 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
  * with such an SDK had the link stop on "undefined symbol: IID_IDXGIFactory6". */
 static const IID IID_IDXGIFactory6_ = {0xC1B6694F, 0xFF09, 0x44A9, {0xB0, 0x3C, 0x77, 0x90, 0x0A, 0x0A, 0x1D, 0x17}};
 
+static const char *cache_dir(void);
+
 static void adapter_name(const DXGI_ADAPTER_DESC1 *d, char *out, size_t size) {
     size_t i = 0;
     for (; i + 1 < size && d->Description[i]; i++) out[i] = d->Description[i] < 128 ? (char)d->Description[i] : '?';
@@ -553,6 +572,9 @@ static void adapter_name(const DXGI_ADAPTER_DESC1 *d, char *out, size_t size) {
 
 /* The graphics cards' names, fastest first, without the software ones (the settings menu). */
 int gfx_adapter_names(char names[][64], int max) {
+#ifndef _WIN32
+    nv_cache_vulkan_setup(cache_dir());   /* (Linux: NVIDIA's driver cache in the game's folder, before DXVK loads the driver) */
+#endif
     IDXGIFactory1 *f1;
     if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f1))) return 0;
     IDXGIFactory6 *f6 = NULL;
@@ -585,6 +607,9 @@ static IDXGIAdapter1 *pick_adapter(int *warp) {
     *warp = !_stricmp(want, "warp");
     if (*warp) return NULL;
     int any = !*want || !_stricmp(want, "auto");
+#ifndef _WIN32
+    nv_cache_vulkan_setup(cache_dir());   /* (Linux: as gfx_adapter_names; once: it then finds the variable set) */
+#endif
     IDXGIFactory1 *f1;
     if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f1))) return NULL;
     IDXGIFactory6 *f6 = NULL;
@@ -692,6 +717,8 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
      * compile for it, and its workers on every core left a 4-core laptop's start nothing: it stopped
      * after "drawing with", before the built-in shaders were compiled) */
     game_mutex = CreateMutexA(NULL, FALSE, WARM_GAME);
+#else
+    game_lock_take();   /* (the same for Linux: WARM_GAME_LOCK) */
 #endif
     gfx_renderer_start(window);   /* (display.ini's renderer: this one draws unless another can: gpu_renderer.c) */
 
@@ -1172,7 +1199,7 @@ static int create_noted(struct Compiler *me, Shader *s, const void *code, size_t
 }
 
 /* ---- prewarm: the disk cache made ready while the game starts --------------------------
- * Every DXBC file of this SHADER_CACHE_VERSION the game has used before (gpu_shader_cache.h),
+ * Every DXBC file of this SHADER_CACHE_DXBC_VERSION the game has used before (gpu_shader_cache.h),
  * newest first, is created on the rendering device by the compiler threads (queue 2, below the
  * game's own shaders) into a table by the cache's key. (The compile device is for a full compile
  * on a compiler thread; a warmed cache's object is all the prewarm needs.)
@@ -1583,14 +1610,14 @@ static int newest_first(const void *a, const void *b) {
     return x < y ? 1 : x > y ? -1 : 0;
 }
 
-/* The disk cache's files of this SHADER_CACHE_VERSION that the game has used (not the ahead-of-time
+/* The disk cache's files of this SHADER_CACHE_DXBC_VERSION that the game has used (not the ahead-of-time
  * compiler's it never asked for; with all, those too), newest first: the shaders of what was
  * played last, first, and the ahead-of-time compiler's (dated 2001) after every played one. */
 static u32 cache_files(const char *dir, Found **out, int all) {
     Found *found = NULL;
     u32 n = 0, cap = 0;
     char pattern[1100];
-    snprintf(pattern, sizeof pattern, "%s/v%u_*.dxbc", dir, SHADER_CACHE_VERSION);
+    snprintf(pattern, sizeof pattern, "%s/v%u_*.dxbc", dir, SHADER_CACHE_DXBC_VERSION);
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(pattern, &fd);
     for (BOOL more = h != INVALID_HANDLE_VALUE; more; more = FindNextFileA(h, &fd)) {
@@ -1705,7 +1732,7 @@ static u32 prewarm_queue_named(const char *list, u32 total, Shader **head, Shade
         if (!m || line[0] == '#') continue;
         (*listed)++;
         if (*queued >= total) continue;
-        snprintf(fname, sizeof fname, "v%u_%s.dxbc", SHADER_CACHE_VERSION, line);
+        snprintf(fname, sizeof fname, "v%u_%s.dxbc", SHADER_CACHE_DXBC_VERSION, line);
         snprintf(file, sizeof file, "%s/%s", cache_dir(), fname);
         if (GetFileAttributesA(file) == INVALID_FILE_ATTRIBUTES) continue;   /* (not made by Prepare Shaders here) */
         if (*queued == *cap) {
@@ -2381,7 +2408,7 @@ static u32 warm_order_listed(Found *files, u32 n) {
             if (!more) break;
             names = more;
         }
-        snprintf(fname, sizeof fname, "v%u_%s.dxbc", SHADER_CACHE_VERSION, line);
+        snprintf(fname, sizeof fname, "v%u_%s.dxbc", SHADER_CACHE_DXBC_VERSION, line);
         names[count++] = name_hash(fname);
     }
     fclose(f);
@@ -2545,8 +2572,9 @@ int gfx_warm_shaders_main(const char *dir, const char *luid) {
  * made. Each thread here draws programs once on a device of its own, into a 1x1 target, so both
  * caches (DXVK's state cache and Mesa's/RADV's shader cache) have them before the game first
  * needs them. There is no window or swap chain. warm.done and warm.log work as on Windows; a
- * lock file keeps two passes apart. Rewarm (the argument, or SSBU_SHADER_WARM_ALL=1) ignores
- * warm.done, as does a different exe, DXVK library, or SSBU_WARM_DRIVER. */
+ * lock file keeps two passes apart, and a game that starts stops the pass (WARM_GAME_LOCK: exit
+ * code 3). Rewarm (the argument, or SSBU_SHADER_WARM_ALL=1) ignores warm.done, as does a different
+ * exe, DXVK library, or SSBU_WARM_DRIVER. */
 typedef struct WarmRun {
     const char *dir;
     Found *files;
@@ -2569,6 +2597,18 @@ static int warm_lock(const char *dir) {
         return busy ? -2 : -1;
     }
     return fd;
+}
+
+/* Whether a game runs now (it holds WARM_GAME_LOCK shared, game_lock_take): taken exclusively, and let go at once,
+ * only when none does. */
+static int game_running(const char *dir) {
+    char path[1100];
+    snprintf(path, sizeof path, "%s/" WARM_GAME_LOCK, dir);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    int running = flock(fd, LOCK_EX | LOCK_NB) && (errno == EWOULDBLOCK || errno == EAGAIN);
+    close(fd);
+    return running;
 }
 
 /* The driver's part of warm.done's key, which a driver update changes (as the UMD version does on
@@ -2781,9 +2821,10 @@ int gfx_warm_shaders_main(const char *dir, const char *arg) {
     int lock = warm_lock(dir);
     if (lock == -2) { fprintf(stderr, "[warm] another warm pass is running in %s; skipping\n", dir); return 0; }
     if (lock < 0) fprintf(stderr, "[warm] cannot make %s/warm.lock (%s): going on without it\n", dir, strerror(errno));
+    nv_cache_vulkan_setup(dir);   /* (NVIDIA: the GPU code it compiles goes where the game will read it, gpu_nvcache.c) */
     int rewarm = (arg && !strcmp(arg, "rewarm")) || (getenv("SSBU_SHADER_WARM_ALL") && atoi(getenv("SSBU_SHADER_WARM_ALL")));
-    /* the processor below what the user does, as the compile workers are (the game is not running:
-     * Prepare Shaders is) */
+    /* the processor below what the user does, as the compile workers are (Prepare Shaders runs it; a game
+     * that starts meanwhile stops it: game_running) */
     setpriority(PRIO_PROCESS, 0, 10);
     if (!rt_video_init()) {   /* (DXVK's SDL window system, without a window) */
         fprintf(stderr, "[warm] not warmed: DXVK needs SDL's video system, which could not start\n");
@@ -2837,7 +2878,7 @@ int gfx_warm_shaders_main(const char *dir, const char *arg) {
     if (rewarm) fprintf(stderr, "[warm] rewarm: drawing every shader again\n");
     else if (before) fprintf(stderr, "[warm] %u shaders drawn by an earlier run\n", before);
     if (!r.n) {
-        fprintf(stderr, "[warm] no v%u shaders in %s\n", SHADER_CACHE_VERSION, dir);
+        fprintf(stderr, "[warm] no v%u shaders in %s\n", SHADER_CACHE_DXBC_VERSION, dir);
         free(r.done);
         free(r.files);
         if (r.adapter) IDXGIAdapter1_Release(r.adapter);
@@ -2861,16 +2902,19 @@ int gfx_warm_shaders_main(const char *dir, const char *arg) {
     u8 finished[6];
     memset(finished, 0, sizeof finished);
     u32 started = 0;
-    for (u32 i = 0; i < nthreads && before + i < r.n; i++)
+    /* (a game running: none drawn now, exit code 3 - Prepare Shaders starts the pass again once it has closed) */
+    if (before < r.n && game_running(dir)) r.stop = 1;
+    for (u32 i = 0; i < nthreads && before + i < r.n && !r.stop; i++)
         if ((threads[started] = CreateThread(NULL, 16 << 20, warm_worker, &r, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL))) started++;
     if (!started) {
         if (before >= r.n) fprintf(stderr, "[warm] all %u shaders were drawn by an earlier run\n", r.n);
+        else if (r.stop) fprintf(stderr, "[warm] a game is running: %u shaders left for once it has closed\n", r.n - before);
         else fprintf(stderr, "[warm] cannot start the warm threads: the cache was not warmed\n");
         free(r.done);
         free(r.files);
         if (r.adapter) IDXGIAdapter1_Release(r.adapter);
         if (lock >= 0) close(lock);
-        return before >= r.n ? 0 : 1;
+        return before >= r.n ? 0 : r.stop ? 3 : 1;
     }
     fprintf(stderr, "[warm] %u shaders to draw on %s (%u already done), up to %u threads%s%s\n", r.n - before, name, before, started,
             rewarm ? " - rewarming" : "", env || later_pass ? "" : " - a full pass: one thread while the caches are written");
@@ -2889,6 +2933,10 @@ int gfx_warm_shaders_main(const char *dir, const char *arg) {
             }
         }
         if (!live) break;
+        if (!r.stop && game_running(dir)) {   /* (as on Windows: the threads stop after the programs they are drawing) */
+            InterlockedExchange(&r.stop, 1);
+            fprintf(stderr, "[warm] a game started: stopping; the rest is drawn once it has closed\n");
+        }
         LONG at = r.next;
         if (at > (LONG)r.n) at = (LONG)r.n;
         /* (only work whose batch has finished, not just been drawn; before: earlier runs) */
@@ -2940,7 +2988,7 @@ int gfx_warm_shaders_main(const char *dir, const char *arg) {
         u32 left = r.n - ndone;
         char rest[160];
         if (no_device) snprintf(rest, sizeof rest, "no Direct3D 11 device (Vulkan): the cache was not warmed");
-        else if (left) snprintf(rest, sizeof rest, "%u left for the next run", left);
+        else if (left) snprintf(rest, sizeof rest, "%u left for the next run%s", left, r.stop ? " (a game started)" : "");
         else snprintf(rest, sizeof rest, "all %u of the cache drawn", r.n);
         fprintf(out, "%04u-%02u-%02u %02u:%02u: %ld shaders drawn once on %s in %.1f s, %ld of them took over %.0f ms to create or draw, %ld not drawn; "
                      "%u drawn before; %s\n",
@@ -2957,7 +3005,7 @@ int gfx_warm_shaders_main(const char *dir, const char *arg) {
     free(r.files);
     if (r.adapter) IDXGIAdapter1_Release(r.adapter);
     if (lock >= 0) close(lock);
-    return no_device ? 1 : 0;
+    return no_device ? 1 : r.stop && ndone < r.n ? 3 : 0;   /* (3: a game started; Prepare Shaders carries on after it) */
 }
 #endif
 
@@ -3109,6 +3157,9 @@ void d3d11_status_lines(void) {
     fprintf(stderr, "[status] memory: %.0f MB private, graphics %.0f MB on the card + %.0f MB in RAM; %llu shaders made (%llu put away so far), prewarm %ld made / %ld taken by the game / %ld over its budget; %u textures, %u surfaces, %u GPU-resident buffers\n",
             private_bytes() / 1048576.0, vram / 1048576.0, shared / 1048576.0, gfx_stat_shaders, shaders_put_away, (long)prewarm_ready, (long)prewarm_taken,
             (long)prewarm_over, ntextures, nsurfaces, nresidents);
+    if (gfx_stat_standin_draws || gfx_stat_mixed_left)
+        fprintf(stderr, "[status] draws into targets of different sizes: %llu through stand-ins, %llu left as they were\n",
+                gfx_stat_standin_draws, gfx_stat_mixed_left);
     if (!gfx_stat_first_draws) return;
     EnterCriticalSection(&lock);
     fprintf(stderr, "[status] first draws with a shader: %llu, %llu of them over 4 ms (%.0f ms in all); longest %.1f ms (%s)\n",
@@ -3338,6 +3389,7 @@ static WaitSample wait_samples[64];
 static u32 wait_samples_n;
 
 static void wait_logged(u64 waited_ms, int stage, const char *name) {
+    { void perf_shader_wait(double ms); perf_shader_wait((double)waited_ms); }   /* (debug_perf_session.c) */
     if (waited_ms > 4)
         fprintf(stderr, "[gfx] waited %llu ms for cached %s %s\n", (unsigned long long)waited_ms,
                 stage == SHADER_COMPUTE ? "cs" : stage == SHADER_VERTEX ? "vs" : "ps", name);
@@ -3643,9 +3695,18 @@ static Wrote wrote_log[WROTE_LOG];
 static u64 wrote_seq;   /* writes logged so far (an entry is never changed once there: a check
                          * that has seen it must not miss what is added) */
 
+/* Return guest address g if [va, va + size) maps contiguously from g; skip the second walk inside one 4 KB page. */
+static inline u64 gpu_va_contig(u64 va, u64 size) {
+    if (!size) return 0;
+    u64 g = gpu_va_to_guest(va);
+    if (!g) return 0;
+    if ((va & 0xFFF) + size <= 0x1000) return g;
+    return gpu_va_to_guest(va + size - 1) == g + size - 1 ? g : 0;
+}
+
 static void guest_wrote(u64 va, u64 bytes) {   /* bytes == 0: anywhere */
-    u64 lo = 0, hi = ~0ull, g = bytes ? gpu_va_to_guest(va) : 0;
-    if (g && gpu_va_to_guest(va + bytes - 1) == g + bytes - 1) { lo = g; hi = g + bytes; }
+    u64 lo = 0, hi = ~0ull, g = bytes ? gpu_va_contig(va, bytes) : 0;
+    if (g) { lo = g; hi = g + bytes; }
     wrote_log[wrote_seq % WROTE_LOG] = (Wrote){lo, hi};
     wrote_seq++;
 }
@@ -3669,8 +3730,8 @@ static ID3D11ShaderResourceView *upload_gpu(int stage, u32 slot, u64 va, u32 siz
     u32 padded = (size + 15) & ~15u;
     if (!padded) padded = 16;
     LastUpload *lu = &last_upload[stage][slot];
-    u64 g = size && size <= REUSE_MAX ? gpu_va_to_guest(va) : 0;
-    const u8 *src = g && gpu_va_to_guest(va + size - 1) == g + size - 1 ? P(const u8, g) : NULL;   /* (one mapping) */
+    u64 g = size && size <= REUSE_MAX ? gpu_va_contig(va, size) : 0;
+    const u8 *src = g ? P(const u8, g) : NULL;   /* (one mapping) */
     int keep = src != NULL;   /* compared now, and a copy kept to compare with next time */
     if (lu->frame != gfx_stat_presented) {   /* a new frame: was the last one counted all misses? */
         if (lu->tries >= REUSE_TRIES && !lu->hits) lu->paused_to = gfx_stat_presented + REUSE_PAUSE;
@@ -3743,16 +3804,21 @@ static ID3D11ShaderResourceView *upload_raw(int stage, u32 slot, const void *dat
     if (size > u->cap) {
         if (u->srv) ID3D11ShaderResourceView_Release(u->srv);
         if (u->buf) ID3D11Buffer_Release(u->buf);
+        *u = (Upload){0};   /* a failed grow must leave no released object for the next draw */
         u32 cap = 1024;
         while (cap < size) cap *= 2;
         D3D11_BUFFER_DESC bd = {cap, D3D11_USAGE_DYNAMIC, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_WRITE,
                                 D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
-        if (FAILED(ID3D11Device_CreateBuffer(dev, &bd, NULL, &u->buf))) { u->cap = 0; u->buf = NULL; return NULL; }
+        if (FAILED(ID3D11Device_CreateBuffer(dev, &bd, NULL, &u->buf))) { u->buf = NULL; return NULL; }
         D3D11_SHADER_RESOURCE_VIEW_DESC sd = {DXGI_FORMAT_R32_TYPELESS, D3D11_SRV_DIMENSION_BUFFEREX};
         sd.BufferEx.FirstElement = 0;
         sd.BufferEx.NumElements = cap / 4;
         sd.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
-        ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)u->buf, &sd, &u->srv);
+        if (FAILED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)u->buf, &sd, &u->srv))) {
+            ID3D11Buffer_Release(u->buf);
+            *u = (Upload){0};
+            return NULL;
+        }
         u->cap = cap;
     }
     D3D11_MAPPED_SUBRESOURCE m;
@@ -3770,9 +3836,9 @@ static int params_known;
 
 /* Copy guest GPU memory [va, va + size) into dst (zeros where unmapped). */
 static void read_gpu(u64 va, u32 size, void *dst) {
-    u64 g = gpu_va_to_guest(va);
     if (!size) return;
-    if (g && gpu_va_to_guest(va + size - 1) == g + size - 1) { memcpy(dst, P(void, g), size); return; }
+    u64 g = gpu_va_contig(va, size);
+    if (g) { memcpy(dst, P(void, g), size); return; }
     /* not one contiguous mapping: page by page, zeros where unmapped */
     for (u32 done = 0; done < size;) {
         u32 n = 0x1000 - (u32)((va + done) & 0xFFF);
@@ -4588,6 +4654,7 @@ static ID3D11Texture2D *unpack_texture(ID3D11Texture2D *bc, const TextureDesc *d
     return out;
 }
 
+static int rt565_swapped_now;   /* get_texture's last: a B5G6R5 target read through a B5G6R5 header (gpu_texture.h) */
 static int draw_reads_wide;   /* (SSBU_ASPECT: the draw being bound samples a widened target) */
 static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type, float *scale) {
     TextureDesc d;
@@ -4610,7 +4677,9 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type, fl
     if (rt && draw_logging) note_sampled(rt);
     if (rt && rt->wide > 1.0f) draw_reads_wide = 1;
     if (rt && rt->depth) depth_sampled_now = rt;
+    rt565_swapped_now = rt && !rt->depth && ok && rt565_read_swaps(rt->format, d.format);
     if (rt) { *scale = rt->sx; return surface_srv(rt, (int)d.srgb); }
+    if (ok && d.astc && d.type == TIC_3D) ok = 0;
     if (!ok || d.type == TIC_1D_BUFFER || d.bytes == 0) { warn_texture(&d); return NULL; }
     u32 layers = d.type == TIC_CUBE ? 6 : d.type == TIC_CUBE_ARRAY ? 6 * d.depth : d.type == TIC_2D_ARRAY || d.type == TIC_1D_ARRAY ? d.depth : 1;
     if (d.type == TIC_3D) layers = 1;
@@ -4673,7 +4742,7 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type, fl
     if (d.type != TIC_CUBE && d.type != TIC_CUBE_ARRAY) td.MiscFlags = 0;
     Unpacked unpacked;
     int unpack = 0;
-    if (d.bw > 1 && ((d.width % 4) || (d.height % 4))) {   /* block-compressed sizes must be multiples of 4 at level 0 */
+    if (d.bw > 1 && !d.astc && ((d.width % 4) || (d.height % 4))) {   /* block-compressed sizes must be multiples of 4 at level 0 */
         td.Width = (d.width + 3) & ~3u; td.Height = (d.height + 3) & ~3u;
         if (!(gfx_debug() & 128) && (unpack = unpacked_formats(d.dxgi, &unpacked))) td.Format = unpacked.bc;
     }
@@ -4684,7 +4753,8 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type, fl
      * uncompressed copy is kept only when a clear texel had to be repaired: a whole scene of
      * untouched sRGB blocks would be a lot of texture. */
     int cpu_bc = 0, punch_only = 0;
-    if (!unpack && d.srgb && d.bw > 1 && d.width <= 1024 && d.height <= 1024 && !(gfx_debug() & 128)) {
+    if (d.astc) cpu_bc = (int)d.astc;   /* ASTC (Mii parts): no Direct3D format, always decoded here, no punching */
+    else if (!unpack && d.srgb && d.bw > 1 && d.width <= 1024 && d.height <= 1024 && !(gfx_debug() & 128)) {
         cpu_bc = srgb_bc_nvn(d.dxgi);
         punch_only = d.width > 512 || d.height > 512;
     }
@@ -4710,6 +4780,7 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type, fl
             mem[layer * levels + l] = buf;
         }
     AsyncDecode *adec = NULL;
+    int astc_failed = 0;
     if (cpu_bc) {
         /* The decode (and the punch it is for) off the render thread: a compiler thread decodes
          * into its own buffers (decode_job_run), and a later get_texture swaps the decoded copy
@@ -4722,8 +4793,8 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type, fl
         static int async_decode;
         if (!async_decode)
             async_decode = on_dxvk() && (!getenv("SSBU_ASYNC_DECODE") || atoi(getenv("SSBU_ASYNC_DECODE")) != 0) ? 1 : -1;
-        int decode_here = async_decode <= 0;
-        if (async_decode > 0) {
+        int decode_here = async_decode <= 0 || d.astc;   /* (ASTC: never the async job, always here - its blocks are no D3D format) */
+        if (async_decode > 0 && !d.astc) {
             adec = calloc(1, sizeof *adec);
             if (adec) {
                 *adec = (AsyncDecode){AD_LOAD, d, levels, layers, td.MiscFlags, (int)shader_type, punch_only, 0, mem, NULL};
@@ -4744,7 +4815,7 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type, fl
             for (u32 i = 0; i < levels * layers; i++) {
                 u32 l = i % levels;
                 u32 tw = (d.width >> l) ? d.width >> l : 1, th = (d.height >> l) ? d.height >> l : 1;
-                punched += punch_clear_texels(rgba[i], tw * th);
+                if (!d.astc) punched += punch_clear_texels(rgba[i], tw * th);
             }
         if (decoded && !(punch_only && !punched)) {
             for (u32 i = 0; i < levels * layers; i++) {
@@ -4759,11 +4830,12 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type, fl
         } else {
             if (rgba) for (u32 i = 0; i < levels * layers; i++) free(rgba[i]);
             cpu_bc = 0;
+            if (d.astc) astc_failed = 1;   /* (the blocks are no RGBA8 texture) */
         }
         free(rgba);
         }
     }
-    HRESULT hr = ID3D11Device_CreateTexture2D(dev, &td, init, &t->tex);
+    HRESULT hr = astc_failed ? E_FAIL : ID3D11Device_CreateTexture2D(dev, &td, init, &t->tex);
     if (adec) {
         if (SUCCEEDED(hr)) {
             /* CreateTexture2D has read the blocks: the worker may free them from here on. */
@@ -4798,7 +4870,7 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type, fl
                   : unpacked.read != d.dxgi ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
         gfx_stat_unpacked++;
     }
-    if (cpu_bc) sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    if (cpu_bc) sd.Format = d.astc && !d.srgb ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     switch (shader_type) {
     case TEX_ARRAY_2D: sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY; sd.Texture2DArray.MipLevels = levels; sd.Texture2DArray.ArraySize = layers; break;
     case TEX_CUBE: sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE; sd.TextureCube.MipLevels = levels; break;
@@ -5036,8 +5108,8 @@ static void kept_apply(u64 lo, u64 hi) {
         /* Only from the memory it was made from, still mapped there: the guest may have mapped
          * other memory at these addresses since (and unmapped the old: the driver would fault
          * reading it). Otherwise it is taken again, or made again, at its next use. */
-        u64 g = gpu_va_to_guest(a);
-        if (g != e->guest + (a - e->va) || gpu_va_to_guest(z - 1) != g + (z - 1 - a)) { e->stale = 1; continue; }
+        u64 g = gpu_va_contig(a, z - a);
+        if (g != e->guest + (a - e->va)) { e->stale = 1; continue; }
         D3D11_BOX box = {(UINT)(a - e->va), 0, 0, (UINT)(z - e->va), 1, 1};
         ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)e->buf, 0, &box, P(void, e->guest + (a - e->va)), 0, 0);
         if (e->shadow) memcpy(e->shadow + (a - e->va), P(void, e->guest + (a - e->va)), (size_t)(z - a));
@@ -5072,6 +5144,7 @@ void d3d11_stream_end(void) {
 
 /* How much of [va, va + size) maps to guest memory in one piece from g (at va). */
 static u32 kept_mapped(u64 va, u64 g, u32 size) {
+    if ((va & 0xFFF) + size <= 0x1000) return size;
     u32 mapped = 0x1000 - (u32)(va & 0xFFF);   /* (the 64 KB bound may run past what is mapped: that part reads as zeros) */
     while (mapped < size && gpu_va_to_guest(va + mapped) == g + mapped) mapped += 0x1000;
     return mapped > size ? size : mapped;
@@ -5307,16 +5380,32 @@ static u32 depth_green_red(u32 swz) {
 }
 static int depth_24bit(u32 zeta_format) { return zeta_format == 0x14 || zeta_format == 0x15 || zeta_format == 0x16; }
 
+int interp_probe_on(void);   /* (gpu_interp_probe.c, SSBU_INTERP_PROBE) */
+void interp_probe_cb(int kind, u64 program, const char *name, u32 bank, u64 va, u32 size, void (*read)(u64, u32, void *));
+void interp_probe_draw(u64 vs, u64 ps, u64 data, u32 count, u64 target);
+void interp_probe_dispatch(u64 program);
+static int interp_probing = -1;
+void motion_draw(u64 vs, u64 ps, u64 data, u32 count, u64 target);   /* (gpu_motion.c: display.ini's motion) */
+void motion_dispatch(u64 program);
+int motion_active(void);
+const void *motion_block(int compute, u32 bank, u32 tex_bank, u64 va, u32 size, void (*read)(u64, u32, void *));
+
 static void bind_resources(const u32 *regs, const CbBinding cb[STAGES][18], int stage, const Shader *s, DrawParams *params) {
     int mstage = stage == SHADER_VERTEX ? STAGE_VERTEX : STAGE_FRAGMENT;
     ID3D11ShaderResourceView *srv[18] = {0};
     static u8 data[0x10000];
     (void)regs;
+    if (interp_probing < 0) interp_probing = interp_probe_on() == 1;
     for (u32 b = 0; b < 18; b++) {
         if (!(s->info.cbuf_mask >> b & 1)) continue;
         u32 size = cb[mstage][b].size;
         if (size > 0x10000) size = 0x10000;
         if (size > s->info.cbuf_extent[b]) size = s->info.cbuf_extent[b];   /* only what the program can read */
+        if (interp_probing) interp_probe_cb(stage == SHADER_VERTEX ? 0 : 1, s->hash, s->name, b, cb[mstage][b].address, size, read_gpu);
+        if (stage == SHADER_VERTEX && motion_active()) {   /* (display.ini's motion: blended) */
+            const void *m = motion_block(0, b, regs[M_BINDLESS_TEXTURE] & 0x1F, cb[mstage][b].address, size, read_gpu);
+            if (m) { srv[b] = upload_raw(stage, b, m, size); continue; }
+        }
         if (cam_hunt_draw && stage == SHADER_VERTEX && cb[mstage][b].address && size >= 64) cam_hunt_cb(s, b, cb[mstage][b].address, size);
         if (size >= 0x1000 && cb[mstage][b].address && !draw_logging && (srv[b] = kept_cb(cb[mstage][b].address, size)))
             continue;   /* big ones stay on the GPU */
@@ -5411,11 +5500,13 @@ static void bind_resources(const u32 *regs, const CbBinding cb[STAGES][18], int 
         float scale;
         Surface *depth_before = depth_sampled_now;
         depth_sampled_now = NULL;
+        rt565_swapped_now = 0;
         tex[k] = get_texture(tic, s->info.tex[k].type, &scale);
         if (k < 16) smp[k] = get_sampler(tsc);
         params->swz[stage][k] = (tic[0] >> 19) & 0xFFF;
         if (depth_sampled_now && depth_24bit(depth_sampled_now->format)) params->swz[stage][k] = depth_green_red(params->swz[stage][k]);
         if (!depth_sampled_now) depth_sampled_now = depth_before;
+        if (rt565_swapped_now) params->swz[stage][k] = swz_swap_rb(params->swz[stage][k]);
         /* a render target's render scale, 4.12 fixed point in the top half (0: 1), for the few
          * programs that step in texels (gpu_shader.c: tsc_) */
         if (scale != 1.0f) params->swz[stage][k] |= (u32)(scale * 4096.0f + 0.5f) << 16;
@@ -5517,6 +5608,115 @@ static void gpu_times_frame(void) {
     free(t);
 }
 
+/* Targets of different sizes in one draw. The hardware draws where all of them are: the smallest's
+ * area (some Final Smashes draw a 480x270 colour target beside a 512x270 one). Direct3D 11 refuses
+ * such a set outright: OMSetRenderTargets leaves the targets bound before it, and the draws land in
+ * those instead - at render scale 2, a black box over the top-left quarter of the picture (#315,
+ * #76). So a colour target bigger than the smallest one draws into a stand-in of the smallest size
+ * and format: its part there is copied in before the draw and back after it (the part outside it
+ * the hardware would not draw either). What a stand-in cannot mend is left as it was, and said
+ * once: a depth target bigger than the smallest colour one (Direct3D copies depth only whole), and
+ * targets of different render scales (SSBU_ASPECT widens 16:9 targets only). */
+typedef struct Standin { DXGI_FORMAT storage, view; u32 w, h; ID3D11Texture2D *tex; ID3D11RenderTargetView *rtv; u64 used, taken; } Standin;
+static Standin standins[8];   /* (a draw takes at most 7: one target is the smallest) */
+
+static void mixed_note(const char *what, u32 w, u32 h) {
+    static u32 told;
+    if (told++ < 8) fprintf(stderr, "[gfx] a draw's targets differ in size (%ux%u the smallest): %s\n", w, h, what);
+}
+
+/* A stand-in of w x h for surface s, not yet taken by this draw (`draw`). */
+static Standin *standin_for(const Surface *s, u32 w, u32 h, u64 draw) {
+    static u64 clock;
+    Standin *lru = NULL;
+    for (u32 i = 0; i < 8; i++) {
+        Standin *t = &standins[i];
+        if (t->taken == draw) continue;   /* (another target of this draw has it) */
+        if (t->tex && t->storage == s->storage && t->view == s->view && t->w == w && t->h == h) { t->used = ++clock; t->taken = draw; return t; }
+        if (!lru || !t->tex || (lru->tex && t->used < lru->used)) lru = t;
+    }
+    if (!lru) return NULL;
+    if (lru->tex) { bury(lru->rtv); bury(lru->tex); memset(lru, 0, sizeof *lru); }   /* (may be bound still) */
+    D3D11_TEXTURE2D_DESC td = {w, h, 1, 1, s->storage, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET, 0, 0};
+    HRESULT hr = ID3D11Device_CreateTexture2D(dev, &td, NULL, &lru->tex);
+    if (SUCCEEDED(hr)) {
+        D3D11_RENDER_TARGET_VIEW_DESC rd;
+        memset(&rd, 0, sizeof rd);
+        rd.Format = s->view;
+        rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        hr = ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)lru->tex, &rd, &lru->rtv);
+        if (FAILED(hr)) ID3D11Texture2D_Release(lru->tex);
+    }
+    if (FAILED(hr)) {
+        memset(lru, 0, sizeof *lru);
+        static u32 told;
+        if (told++ < 4) fprintf(stderr, "[gfx] cannot make a %ux%u stand-in target (format %u): %#lx\n", w, h, (unsigned)s->view, (unsigned long)hr);
+        return NULL;
+    }
+    lru->storage = s->storage; lru->view = s->view; lru->w = w; lru->h = h; lru->used = ++clock; lru->taken = draw;
+    return lru;
+}
+
+/* Colour targets of one draw made one size: rtv[] and standin[] filled in for those drawn
+ * through stand-ins. Targets all of one size (nearly every draw), and the cases a stand-in
+ * cannot mend, are left as they are. */
+static void mixed_targets(Surface *const rts[8], const Surface *zsf, ID3D11RenderTargetView *rtv[8], Standin *standin[8]) {
+    u32 w = 0, h = 0, mixed = 0;
+    float sx = 0, sy = 0;
+    int scales = 0;
+    for (u32 i = 0; i < 8; i++) {
+        if (!rts[i]) continue;
+        if (w && (rts[i]->hw != w || rts[i]->hh != h)) mixed = 1;
+        if (sx && (rts[i]->sx != sx || rts[i]->sy != sy)) scales = 1;
+        if (!w || rts[i]->hw < w) w = rts[i]->hw;
+        if (!h || rts[i]->hh < h) h = rts[i]->hh;
+        sx = rts[i]->sx; sy = rts[i]->sy;
+    }
+    if (!w) return;   /* (depth only) */
+    if (zsf && (zsf->hw != w || zsf->hh != h)) {
+        if (zsf->hw > w || zsf->hh > h) {   /* (bigger in either direction: no stand-in fits both) */
+            gfx_stat_mixed_left++;
+            mixed_note("the depth target is bigger, left as it was", w, h);
+            return;
+        }
+        w = zsf->hw;   /* the depth target is the smallest: the colour ones come down to it */
+        h = zsf->hh;
+        mixed = 1;
+    }
+    if (!mixed) return;
+    if (scales) { gfx_stat_mixed_left++; mixed_note("their render scales differ too, left as it was", w, h); return; }
+    static u64 draws;
+    u64 draw = ++draws;
+    for (u32 i = 0; i < 8; i++) {
+        if (!rts[i] || (rts[i]->hw == w && rts[i]->hh == h)) continue;
+        if (!(standin[i] = standin_for(rts[i], w, h, draw))) {
+            memset(standin, 0, 8 * sizeof *standin);
+            gfx_stat_mixed_left++;
+            return;
+        }
+    }
+    D3D11_BOX box = {0, 0, 0, w, h, 1};
+    for (u32 i = 0; i < 8; i++) {
+        if (!standin[i]) continue;
+        ID3D11DeviceContext_CopySubresourceRegion(ctx, (ID3D11Resource *)standin[i]->tex, 0, 0, 0, 0, (ID3D11Resource *)rts[i]->tex, 0, &box);
+        rtv[i] = standin[i]->rtv;
+        static u32 told;
+        if (told++ < 4)
+            fprintf(stderr, "[gfx] colour target %u (%#llx, %ux%u) drawn through a %ux%u stand-in: the draw's targets differ in size\n", i,
+                    rts[i]->guest, rts[i]->width, rts[i]->height, w, h);
+    }
+    gfx_stat_standin_draws++;
+}
+
+/* After the draw: what it drew into each stand-in, into its target. */
+static void standins_back(Surface *const rts[8], Standin *const standin[8]) {
+    for (u32 i = 0; i < 8; i++) {
+        if (!standin[i]) continue;
+        D3D11_BOX box = {0, 0, 0, standin[i]->w, standin[i]->h, 1};
+        ID3D11DeviceContext_CopySubresourceRegion(ctx, (ID3D11Resource *)rts[i]->tex, 0, 0, 0, 0, (ID3D11Resource *)standin[i]->tex, 0, &box);
+    }
+}
+
 void d3d11_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     if (!enter()) return;
     kept_flush();
@@ -5567,12 +5767,13 @@ void d3d11_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     u32 sel = regs[M_CT_SELECT], count = sel & 15, rt_w = 0, rt_h = 0;
     float rt_sx = 1.0f, rt_sy = 1.0f;   /* the targets' render scale: host pixels per game pixel */
     float rt_wide = 1.0f;               /* (SSBU_ASPECT: the first colour target's widening) */
+    Surface *rts[8] = {0};
     for (u32 i = 0; i < count && i < 8; i++) {
         u32 ct = (sel >> (4 + 3 * i)) & 7;
         u64 va = (u64)regs[M_CT(ct)] << 32 | regs[M_CT(ct) + 1];
         if (!va || !regs[M_CT(ct) + 4]) continue;
         Surface *sf = surface(gpu_va_to_guest(va), regs[M_CT(ct) + 2], regs[M_CT(ct) + 3], regs[M_CT(ct) + 4], 0);
-        if (sf) { rtv[i] = sf->rtv; if (!rt_w) { rt_w = sf->width; rt_h = sf->height; rt_sx = sf->sx; rt_sy = sf->sy; rt_wide = sf->wide; } }
+        if (sf) { rts[i] = sf; rtv[i] = sf->rtv; if (!rt_w) { rt_w = sf->width; rt_h = sf->height; rt_sx = sf->sx; rt_sy = sf->sy; rt_wide = sf->wide; } }
     }
     Surface *zsf = NULL;
     /* a draw that writes neither depth nor stencil keeps its depth target read-only, so that it can
@@ -5588,6 +5789,9 @@ void d3d11_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
         }
     }
     if (!rt_w) { gfx_stat_skipped++; gfx_skip_target++; leave(); return; }
+    /* targets of different sizes: the bigger colour ones drawn through stand-ins (see mixed_targets) */
+    Standin *standin[8] = {0};
+    mixed_targets(rts, zsf, rtv, standin);
     /* (a render target bound as a texture of the same draw is unbound by D3D: fine) */
     if (memcmp(cur.rtv, rtv, sizeof rtv) || cur.dsv != dsv) {
         ID3D11DeviceContext_OMSetRenderTargets(ctx, 8, rtv, dsv);
@@ -5813,6 +6017,18 @@ void d3d11_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
 
     draw_reads_wide = 0;
     depth_sampled_now = NULL;
+    if (motion_active()) {   /* (gpu_motion.c: the draw, known by what it draws) */
+        u64 ib = ((u64)regs[M_INDEX_BUFFER] << 32 | regs[M_INDEX_BUFFER + 1]) + regs[M_INDEX_BUFFER + 5];
+        u64 vb = ((u64)regs[M_VERTEX_STREAM(0) + 1] << 32 | regs[M_VERTEX_STREAM(0) + 2]) + regs[M_VERTEX_ARRAY_START];
+        motion_draw(vs->hash, ps ? ps->hash : 0, indexed ? ib : vb, indexed ? regs[M_DRAW_INDEX_COUNT] : regs[M_VERTEX_ARRAY_COUNT],
+                    (u64)(uintptr_t)rts[0]);
+    }
+    if (interp_probing == 1) {   /* (the draw, known by what it draws: its programs, its index or vertex data and count, its target) */
+        u64 ib = ((u64)regs[M_INDEX_BUFFER] << 32 | regs[M_INDEX_BUFFER + 1]) + regs[M_INDEX_BUFFER + 5];
+        u64 vb = ((u64)regs[M_VERTEX_STREAM(0) + 1] << 32 | regs[M_VERTEX_STREAM(0) + 2]) + regs[M_VERTEX_ARRAY_START];
+        interp_probe_draw(vs->hash, ps ? ps->hash : 0, indexed ? ib : vb, indexed ? regs[M_DRAW_INDEX_COUNT] : regs[M_VERTEX_ARRAY_COUNT],
+                          (u64)(uintptr_t)rts[0]);
+    }
     if (ps) bind_resources(regs, cb, SHADER_PIXEL, ps, &params);   /* (first: whether it reads the scene decides the vertex stage's) */
     {   /* (SSBU_DEBUG_CAMERA_HUNT: 3D draws on a widened target, 300 of them every 10 s) */
         static int hunting = -1, budget;
@@ -6020,6 +6236,7 @@ void d3d11_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
          * draw for nothing. */
         if (on_dxvk() && prewarm_settling) pipeline_note(pipe_ms);
     }
+    standins_back(rts, standin);
     if (first) {
         first_draw_done(rt_clock_ns() - first_t0, first);
         if (!vs->drawn) first_used(vs);
@@ -6250,7 +6467,9 @@ static void present_hash(ID3D11Texture2D *tex) {
     char gs[16 * 9 * 2 + 1];
     u64 cell = (u64)(sw / 16) * (sh / 9) * 3;
     for (int i = 0; i < 16 * 9; i++) snprintf(gs + i * 2, 3, "%02x", (unsigned)(cell ? (grid[i] / cell > 255 ? 255 : grid[i] / cell) : 0));
-    fprintf(out, "%llu %lld %d %016llx %s\n", (unsigned long long)n++, test_fight_frame, hid, (unsigned long long)h, gs);
+    extern volatile u32 gpu_lat_shown_tick; extern volatile int gpu_lat_shown_known;   /* (SSBU_LAT_TRACE: the picture's logic frame) */
+    fprintf(out, "%llu %lld %d %016llx %s %u %d\n", (unsigned long long)n++, test_fight_frame, hid, (unsigned long long)h, gs,
+            gpu_lat_shown_tick, gpu_lat_shown_known);
     fflush(out);
 }
 
@@ -6441,10 +6660,17 @@ void d3d11_dispatch(const u32 *regs, const u32 *q) {
     /* constant buffers */
     ID3D11ShaderResourceView *srv[18] = {0};
     static u8 data[0x10000];
+    if (interp_probing < 0) interp_probing = interp_probe_on() == 1;
+    if (interp_probing) interp_probe_dispatch(cs->hash);
+    int blend = motion_active();
+    if (blend) motion_dispatch(cs->hash);
     for (u32 b = 0; b < 18; b++) {
         if (!(cs->info.cbuf_mask >> b & 1)) continue;
         u32 size = cb[b].size > 0x10000 ? 0x10000 : cb[b].size;
         if (size > cs->info.cbuf_extent[b]) size = cs->info.cbuf_extent[b];
+        if (interp_probing) interp_probe_cb(2, cs->hash, cs->name, b, cb[b].address, size, read_gpu);
+        const void *m = blend && cb[b].address && size ? motion_block(1, b, 0xFF, cb[b].address, size, read_gpu) : NULL;
+        if (m) { srv[b] = upload_raw(SHADER_COMPUTE, b, m, size); continue; }
         if (cb[b].address && size) read_gpu(cb[b].address, size, data);
         else { size = 16; memset(data, 0, 16); }
         srv[b] = upload_raw(SHADER_COMPUTE, b, data, size);
@@ -6697,6 +6923,59 @@ static void gpu_timer_frame(void) {
     frame_event_cur = (frame_event_cur + 1) % FRAME_EVENTS;
 }
 
+/* The GPU's time per frame shown (display.h: gpu_frame_time_push; SSBU_GPU_TIMESTAMPS=0: off): a timestamp after each
+ * present, which the card writes when it reaches the next frame's first command, and one before the next present,
+ * inside a disjoint query; read back with DONOTFLUSH at the presents after (a ring of 8: never waited for, a frame
+ * whose set is still in flight goes untimed). From the frame's first command to its last: the card waiting between
+ * the commands while they are translated counts too, so it is the frame's span on the card, not its busy time. */
+#define FRAME_TS 8
+static ID3D11Query *frame_ts[FRAME_TS][3];   /* (disjoint, begin, end) */
+static int frame_ts_state[FRAME_TS], frame_ts_open = -1, frame_ts_failed;   /* (state: 0 free, 1 open, 2 ended) */
+static u32 frame_ts_read, frame_ts_cur;
+static int frame_ts_ready(void) {
+    if (frame_ts_failed || !gpu_timestamps_on()) return 0;
+    if (frame_ts[FRAME_TS - 1][2]) return 1;
+    D3D11_QUERY_DESC dq = {D3D11_QUERY_TIMESTAMP_DISJOINT, 0}, tq = {D3D11_QUERY_TIMESTAMP, 0};
+    for (u32 i = 0; i < FRAME_TS; i++)
+        if (FAILED(ID3D11Device_CreateQuery(dev, &dq, &frame_ts[i][0])) || FAILED(ID3D11Device_CreateQuery(dev, &tq, &frame_ts[i][1])) ||
+            FAILED(ID3D11Device_CreateQuery(dev, &tq, &frame_ts[i][2]))) {
+            frame_ts_failed = 1;
+            for (u32 j = 0; j <= i; j++)
+                for (u32 k = 0; k < 3; k++) if (frame_ts[j][k]) { ID3D11Query_Release(frame_ts[j][k]); frame_ts[j][k] = NULL; }
+            fprintf(stderr, "[gfx] GPU timestamps: cannot make the queries, frames not timed\n");
+            return 0;
+        }
+    return 1;
+}
+static void frame_ts_before_present(void) {   /* (the frame's end, and the frames ended before read if they are) */
+    if (!frame_ts_ready()) return;
+    while (frame_ts_state[frame_ts_read] == 2) {
+        ID3D11Query **q = frame_ts[frame_ts_read];
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
+        UINT64 t0 = 0, t1 = 0;
+        if (ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)q[0], &dj, sizeof dj, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) break;
+        if (ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)q[1], &t0, sizeof t0, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
+            ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)q[2], &t1, sizeof t1, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) break;
+        if (!dj.Disjoint && dj.Frequency && t1 >= t0) gpu_frame_time_push((double)(t1 - t0) * 1000.0 / (double)dj.Frequency, 0, 0);
+        frame_ts_state[frame_ts_read] = 0;
+        frame_ts_read = (frame_ts_read + 1) % FRAME_TS;
+    }
+    if (frame_ts_open >= 0) {
+        ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)frame_ts[frame_ts_open][2]);
+        ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)frame_ts[frame_ts_open][0]);
+        frame_ts_state[frame_ts_open] = 2;
+        frame_ts_open = -1;
+    }
+}
+static void frame_ts_after_present(void) {   /* (the next frame's start) */
+    if (!frame_ts_ready() || frame_ts_state[frame_ts_cur]) return;   /* (its set still in flight: this frame untimed) */
+    ID3D11DeviceContext_Begin(ctx, (ID3D11Asynchronous *)frame_ts[frame_ts_cur][0]);
+    ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)frame_ts[frame_ts_cur][1]);
+    frame_ts_state[frame_ts_cur] = 1;
+    frame_ts_open = (int)frame_ts_cur;
+    frame_ts_cur = (frame_ts_cur + 1) % FRAME_TS;
+}
+
 /* ---- a lost device: Windows reset the GPU (some GPU work ran past its 2-second limit), or the
  * driver failed, restarted or was updated. Every object of the device is dead from then on and
  * nothing can be drawn again, so the game stops, saying why. (Before, a player's game stopped 98
@@ -6748,6 +7027,7 @@ static volatile LONG presented_once;
 void d3d11_present(u64 guest, u32 width, u32 height) {
     (void)width; (void)height;
     if (!enter()) return;
+    { void gpu_lat_shown_note(u64 g); gpu_lat_shown_note(guest); }   /* (SSBU_LAT_TRACE: the picture's logic frame, gpu.c) */
     last_present_guest = guest;
     presented_once = 1;
     watchdog_present();
@@ -7068,6 +7348,7 @@ void d3d11_present(u64 guest, u32 width, u32 height) {
     ID3D11Texture2D_Release(back);
     gpu_timer_frame();
     gpu_times_frame();
+    frame_ts_before_present();
     LARGE_INTEGER p0, p1;
     QueryPerformanceCounter(&p0);
     static int gated;
@@ -7078,12 +7359,16 @@ void d3d11_present(u64 guest, u32 width, u32 height) {
         if (!on_dxvk()) prewarm_gate();
     }
     display_before_present();   /* (gpu_display.c: the loading animation stops) */
-    hr = IDXGISwapChain1_Present(swapchain, 0, display_present_flags());   /* (blocks while the GPU is frames behind) */
+    /* (`display` pacing cannot wait for this monitor's refreshes - the panel is another card's - or its rate is no
+     * multiple of 60: sync interval 1 makes the present itself wait for the vblank; ALLOW_TEARING is only asked for with 0) */
+    UINT sync = display_present_sync() && !(display_present_flags() & 0x200u) ? 1 : 0;
+    hr = IDXGISwapChain1_Present(swapchain, sync, display_present_flags());   /* (blocks while the GPU is frames behind) */
 #ifdef _WIN32
     if (SUCCEEDED(hr)) display_show_window();
 #endif
     QueryPerformanceCounter(&p1);
     gfx_stat_present_ticks += (u64)(p1.QuadPart - p0.QuadPart);
+    frame_ts_after_present();
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) check_device(hr, "showing a frame");
     leave();
 }

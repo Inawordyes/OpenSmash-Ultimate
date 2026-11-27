@@ -3,7 +3,7 @@ pad (Restart game and Quit game under each page's rows), the text grid the game'
 typed on (the one the menu's own names use: pad and keyboard), and its Lobby page: the online lobby's room browser and
 matchmaking in netplay version 3, and Online > Netplay version (online_protocol.txt), through
 tools/dev/lobbymenutest.c (the menu and the game's netplay client with no game around them, driven
-line by line), against fake lobbies that answer by hand and the real one (tools/ssbu_relay.py) on
+line by line), against fake lobbies that answer by hand and the real one (the lobby server: tests/netproto.py) on
 127.0.0.1. Checks what the page shows (the rooms, with why one can't be joined; matchmaking's states;
 version 2's "needs netplay version 3"), what its keys do and send, which version the game asks for,
 and that the other pages keep their rows. Made-up data only, loopback only; waits are for conditions.
@@ -13,6 +13,7 @@ runtime/hle_settings.c beside it; off Windows with a stand-in d3d11.h (gpu_overl
 its types). Skipped where that test is."""
 from pathlib import Path
 import os
+import re
 import queue
 import shutil
 import socket
@@ -27,10 +28,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 sys.path.insert(0, str(ROOT / 'tests'))
 import cc  # noqa: E402
-import ssbu_relay as R  # noqa: E402
-from test_net_client_v3 import FAKE_COOKIE, FAKE_IP, HAVE_CLANG, SIM, FakeLobby, V2OnlyLobby, free_udp_port  # noqa: E402
-from test_ssbu_relay import BUILD, OTHER_BUILD, Server  # noqa: E402
-from test_ssbu_relay_v3 import V3Player, mods, until  # noqa: E402
+import netproto as R  # noqa: E402
+from netproto import BUILD, HAVE_LOBBY, NO_LOBBY, OTHER_BUILD, mods, need_lobby, until  # noqa: E402
+from test_net_client_v3 import FAKE_COOKIE, FAKE_IP, HAVE_CLANG, SIM, FakeLobby, Server, V2OnlyLobby, V3Player, free_udp_port  # noqa: E402
 
 D3D11_STAND_IN = ('typedef struct ID3D11Device ID3D11Device;\ntypedef struct ID3D11DeviceContext ID3D11DeviceContext;\n'
                   'typedef struct ID3D11RenderTargetView ID3D11RenderTargetView;\n')
@@ -40,7 +40,7 @@ NO_ANSWER = 'no answer from the lobby (A: ask again)'
 
 
 def build(folder, yuzu=False):
-    src = ['tools/dev/lobbymenutest.c', 'runtime/net_relay.c', 'runtime/net_eos.c', 'runtime/hle_settings.c']
+    src = ['tools/dev/lobbymenutest.c', 'runtime/net_relay.c', 'runtime/net_region.c', 'runtime/hle_settings.c']
     if yuzu:
         src += ['runtime/net_yuzu.c', 'runtime/net_yuzu_wire.c']
     if os.name == 'nt':   # (as tests/test_net_client_v3.py builds netv3test.c)
@@ -71,6 +71,7 @@ class Menu:
         env.update({k: str(v) for k, v in more.items()})
         self.dir = Path(tempfile.mkdtemp(prefix='menu ', dir=top))
         for f, text in (files or {}).items():
+            (self.dir / f).parent.mkdir(parents=True, exist_ok=True)   # (config/server_region.txt)
             (self.dir / f).write_text(text, encoding='utf-8')
         self.name = name
         self.p = subprocess.Popen([exe, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", env=env,
@@ -136,8 +137,9 @@ class Menu:
         out = []
         for _ in range(n):
             ids, label, value, note, helptext = self.answer().split('|')
-            rid, kind = map(int, ids.split()[1:])
-            out.append(dict(id=rid, kind=kind, label=label, value=value, note=note, help=helptext))
+            rid, kind = map(int, ids.split()[1:3])
+            gaps = float(ids.split()[3])
+            out.append(dict(id=rid, kind=kind, gaps=gaps, label=label, value=value, note=note, help=helptext))
         return is_open, page, sel, out
 
     def rows(self):
@@ -377,10 +379,19 @@ class Pages(MenuTest):
     def test_other_pages_as_before(self):
         m = self.menu()
         m.key('ESC')
-        display = ['Window', 'Frame pacing', 'Frames queued ahead'] + ['Hide the mouse pointer', 'Frame rate in the corner', 'Window size',
-                   'Render scale', 'Aspect ratio', 'Viewtype', 'Timer position'] + (['Graphics card'] if os.name == 'nt' else []) \
-            + (['Renderer'] if sys.platform != 'darwin' else [])
-        self.assertEqual(m.labels(), display)
+        renderer = ['Renderer'] if sys.platform != 'darwin' else []   # (#429: in sight, under Picture)
+        display = ['Window', 'Window size', 'Render scale', 'Aspect ratio', 'Viewtype', *renderer, 'Frame pacing', 'Frame rate',
+                   'Motion between frames', 'Show advanced settings']
+        self.assertEqual(m.labels(), display)   # (the everyday rows; the rest are behind the switch)
+        m.key('DOWN', sum(1 for r in m.rows()[:m.labels().index('Frame pacing')] if r['kind'] != 0))   # (read-only rows are passed over)
+        self.assertEqual(m.at()['label'], 'Frame pacing')   # (Viewtype is passed over at 16:9)
+        m.key('DOWN', 3)   # (Frame rate, Motion between frames)
+        self.assertEqual(m.at()['label'], 'Show advanced settings')
+        m.key('RIGHT')
+        display = ['Window', 'Window size', 'Render scale', 'Aspect ratio', 'Viewtype', *renderer, 'Frame pacing', 'Frame rate',
+                   'Motion between frames', 'Show advanced settings', 'Hide the mouse pointer', 'Timer position', 'Frames queued ahead', 'Frame rate in the corner'] + (['Graphics card'] if os.name == 'nt' else [])   # (the advanced rows under the switch)
+        self.assertEqual(m.labels(), display)   # (in sections: Window, Picture, Smoothness, Graphics)
+        self.assertIn('show_advanced = 1', (m.dir / 'display.ini').read_text())
         m.type('2')
         self.assertEqual(m.labels(), ['Controllers', 'Keyboard plays as', 'Keyboard keys...', 'Pads when not focused',
                                       'Open controllers.ini'])
@@ -403,14 +414,14 @@ class Pages(MenuTest):
         m.type('4')
         keys = (['F1, Cmd+1', 'F2, Cmd+2', 'F3, Cmd+3', 'Option+Return'] if sys.platform == 'darwin'
                 else ['F1', 'F2', 'F3', 'F11, Alt+Enter'])
-        self.assertEqual(m.labels(), ['Interface language', 'Game language', 'Volume', 'Restart the game', 'Quit the game', 'Esc / Home button', *keys, 'Version'])
+        self.assertEqual(m.labels(), ['Interface language', 'Game language', 'Volume', 'Restart the game', 'Quit the game', 'Esc / Home button', *keys, 'Game version', 'OpenSmash (recomp)', 'Launcher'])
 
     @unittest.skipIf(sys.platform == 'darwin', 'the Mac program has no Renderer row (Metal only)')
     def test_renderer_row(self):
         """Display > Renderer: the system's own renderer (Windows: auto, then direct3d11), then Vulkan,
         saved in display.ini for the next start (runtime/renderer.h's names)."""
         own = 'auto (Direct3D 11)' if os.name == 'nt' else 'dxvk'   # (auto says which one this start drew with)
-        m = self.menu()
+        m = self.menu()   # (#429: the row shows without the advanced switch)
         m.key('ESC')
         labels = m.labels()
         at = labels.index('Renderer')
@@ -422,6 +433,7 @@ class Pages(MenuTest):
             m.key('RIGHT')
             self.assertEqual(m.row('Renderer')['value'], 'direct3d11')
             self.assertIn('renderer = direct3d11', (m.dir / 'display.ini').read_text())
+            self.assertIn('renderer_menu = direct3d11', (m.dir / 'display.ini').read_text())   # (kept over an older launcher's d3d11)
         m.key('RIGHT')
         self.assertEqual(m.row('Renderer')['value'], 'vulkan')
         self.assertIn('renderer = vulkan', (m.dir / 'display.ini').read_text())
@@ -454,11 +466,13 @@ class Mouse(MenuTest):
 
     @staticmethod
     def row_y(j):
-        assert j < 12   # (the rows that fit: the first ones, with nothing scrolled)
-        return 262 + 50 * j
+        assert j < 14   # (the rows that fit: the first ones, with nothing scrolled)
+        return int(262 + 50 * j)
 
     def index(self, m, label):
-        return [r['label'] for r in m.rows()].index(label)
+        rows = m.rows()   # (its place on the screen: the empty rows above it count)
+        i = [r['label'] for r in rows].index(label)
+        return i + rows[i]['gaps']
 
     def test_page_tab(self):
         m = self.menu()
@@ -469,21 +483,22 @@ class Mouse(MenuTest):
     def test_hover_selects_and_a_still_pointer_leaves_the_keys_alone(self):
         m = self.menu()
         m.key('ESC')
-        j = self.index(m, 'Frames queued ahead')
+        j = self.index(m, 'Frame pacing')
         m.ok(f'mouse 500 {self.row_y(j)}')
-        self.assertEqual(m.at()['label'], 'Frames queued ahead')
+        self.assertEqual(m.at()['label'], 'Frame pacing')
         m.key('DOWN')
         m.ok(f'mouse 500 {self.row_y(j)}')   # (the same place again: not a move)
-        self.assertNotEqual(m.at()['label'], 'Frames queued ahead')
+        self.assertNotEqual(m.at()['label'], 'Frame pacing')
 
     def test_choice_steps_by_side(self):
         m = self.menu()
         m.key('ESC')
-        y = self.row_y(self.index(m, 'Frames queued ahead'))
-        self.click(m, 1500, y)   # (right of the value: forward from the stand-in's 1)
-        self.assertRegex(m.file('display.ini'), r'latency\s*=\s*2')
-        self.click(m, 805, y)    # (the value's left half: back, round to 3)
-        self.assertRegex(m.file('display.ini'), r'latency\s*=\s*3')
+        y = self.row_y(self.index(m, 'Frame pacing'))
+        self.click(m, 1500, y)   # (right of the value: forward)
+        forward = re.search(r'pacing\s*=\s*(\w+)', m.file('display.ini')).group(1)
+        self.click(m, 805, y)    # (the value's left half: back)
+        back = re.search(r'pacing\s*=\s*(\w+)', m.file('display.ini')).group(1)
+        self.assertNotEqual(forward, back)
 
     def test_bars_are_left_out_of_the_place(self):
         m = self.menu()
@@ -551,13 +566,42 @@ class Mouse(MenuTest):
         self.click(m, 1000, 700)   # (done)
         self.assertEqual(m.file('online_name.txt'), 'AlA')
 
+    def test_cursor_stays_on_its_row_when_a_page_is_shown_again(self):
+        m = self.menu()
+        m.key('ESC')
+        m.type('3')   # (Online: rows with empty rows between them)
+        m.key('DOWN')
+        before = m.at()['label']
+        for _ in range(3):
+            m.type('2')
+            m.type('3')
+            self.assertEqual(m.at()['label'], before)
+
+    def test_display_cursor_stays_when_the_page_is_shown_again(self):
+        m = self.menu()
+        m.key('ESC')
+        m.type('1')
+        m.key('DOWN', 4)
+        before = m.at()['label']
+        for _ in range(3):
+            m.type('3')
+            m.type('1')
+            self.assertEqual(m.at()['label'], before)
+
     def test_wheel(self):
         m = self.menu()
         m.key('ESC')
+        m.type('7')   # (Experimental: a page that fits; the wheel never moves the cursor, here it does nothing at all)
         before = m.at()['label']
         m.ok('wheel D')
-        self.assertNotEqual(m.at()['label'], before)
+        self.assertEqual(m.at()['label'], before)
         m.ok('wheel U')
+        self.assertEqual(m.at()['label'], before)
+        m.key('ESC')
+        m.type('1')   # (Display: a scroll bar; the wheel scrolls the view, the cursor stays on its row)
+        before = m.at()['label']
+        for _ in range(3):
+            m.ok('wheel D')
         self.assertEqual(m.at()['label'], before)
 
 
@@ -652,6 +696,35 @@ class Pad(MenuTest):
         self.assertNotIn('Reset keyboard keys to defaults?', m.draw())
 
 
+class PcModeSticks(MenuTest):
+    """A GameCube adapter in PC mode on the Sticks page (a stub pad_info, LOBBYMENUTEST_PCPAD)."""
+    def sticks_page(self, mode):
+        m = self.menu(LOBBYMENUTEST_PCPAD=mode)
+        m.key('ESC')
+        m.type('2')   # (Controllers)
+        # (Controllers > Customize controllers... > the controller's row > Sticks...: #402's list of controllers)
+        for want in (('Customize controllers...',), ('Player 1', 'No player'), ('Sticks...',)):
+            for _ in range(20):
+                if m.labels()[m.page()[2]] in want:
+                    break
+                m.key('DOWN')
+            self.assertIn(m.labels()[m.page()[2]], want)
+            m.key('ENTER')
+        return m
+
+    def test_scaled(self):
+        m = self.sticks_page('1')
+        self.assertIn('GameCube stick scaling', m.labels())
+        self.assertEqual(m.row('GameCube stick scaling')['value'], '1:1 Switch')
+        self.assertNotIn('Recalibrate sticks', m.labels())   # (the adapter's own scaling: nothing to measure)
+        self.assertEqual(m.row('Stick dead zone')['value'], 'none (1:1 Switch)')
+
+    def test_zone_of_its_own(self):
+        m = self.sticks_page('2')
+        self.assertIn('GameCube stick scaling', m.labels())
+        self.assertEqual(m.row('Stick dead zone')['value'], '25%')
+
+
 class Keyboard(MenuTest):
     """The game's software keyboard (an arena's name...) on the menu's text grid, the one its own names use:
     a pad or the keyboard types, the game's limits kept, the game waits for the answer."""
@@ -723,7 +796,7 @@ class Version(MenuTest):
         self.assertEqual(m.row('Netplay version')['value'], '3 (being tried out)')
         self.assertEqual(m.file('online_protocol.txt'), '3')
         self.assertIn('Restart now', m.labels())   # (next start)
-        self.assertIn('next start', m.draw())
+        self.assertIn('Takes effect when the game starts again', ' '.join(m.draw()))
         m.type('3')
         r = m.row('Netplay version')
         self.assertEqual((r['value'], r['note'], r['kind']), ('3 (being tried out)', '', 1))
@@ -746,11 +819,11 @@ class Version(MenuTest):
 
     def test_file_asks_for_3(self):
         join, m = self.join_of(files={'online_protocol.txt': '# netplay version\n3\n'})
-        self.assertEqual((join[2], len(join)), (3, R.V3_JOIN_SIZE))
+        self.assertEqual((join[2], len(join)), (3, R.V3_JOIN_SIZE + 4))   # (+ 'C' 'V' and the online level: net_relay.c send_join)
         self.assertEqual(m.net(0)[0], 3)
 
     def test_no_file_as_before(self):
-        tail = 2 + 4 + 1   # (version 2's JOIN ends with 'W' 'S', the simulation version and a mod set: net_relay.c send_join)
+        tail = 2 + 4 + 1 + 4   # (version 2's JOIN ends with 'W' 'S', the simulation version and a mod set, then 'C' 'V' and the online level: net_relay.c send_join)
         join, _ = self.join_of()
         self.assertEqual((join[2], len(join), join[R.JOIN_SIZE:R.JOIN_SIZE + 2]), (2, R.JOIN_SIZE + tail, b'WS'))
         join, _ = self.join_of(files={'online_protocol.txt': '4\n'})   # (not a version: the default)
@@ -791,6 +864,72 @@ class Version(MenuTest):
         self.assertEqual(guest.row('Lobby')['value'], 'in a private room')
 
 
+class Region(MenuTest):
+    """Online > Server region (config/server_region.txt, runtime/net_region.c): Auto with its pick and the pick's ping,
+    or a region; shown with the official lobby only; an install's own official server instead. Nothing is sent to a
+    lobby: the answer times are SSBU_REGION_TEST_PINGS's."""
+    def online(self, server='auto', files=None, **more):
+        m = self.menu(None, files={'online_server.txt': server + '\n', **(files or {})}, SSBU_REGION_TEST_PINGS='eu=24,na-east=120', **more)
+        m.key('ESC')
+        m.type('3')
+        return m
+
+    def test_official_lobby_is_the_default_and_eos_reads_as_it(self):
+        """(#448 on main named the default 'public (worldwide, Epic)'. Here "auto" is the official lobby, relay only, and
+        its label says so. Epic Online Services are gone (0.5.0): an "eos" line reads as the official lobby.)"""
+        m = self.online()
+        self.assertEqual(m.row('Play online in')['value'], 'official lobby (relay only, EU / NA East / SA)')
+        self.assertIn('Server region', m.labels())
+        e = self.online('eos')
+        self.assertEqual(e.row('Play online in')['value'], 'official lobby (relay only, EU / NA East / SA)')
+        self.assertIn('Server region', e.labels())
+        self.assertNotIn('Epic', ' '.join(e.labels()))
+        e.go_to('Play online in')
+        e.key('LEFT')   # (the first choice: around to the last, This network)
+        self.assertEqual((e.row('Play online in')['value'], e.file('online_server.txt')), ('this network (LAN)', 'lan'))
+
+    def test_auto_then_each_region(self):
+        m = self.online(files={'config/server_region_auto.txt': 'eu 24 1700000000\n'})
+        r = m.row('Server region')
+        self.assertEqual((r['value'], r['kind']), ('Auto (EU, 24 ms)', 1))
+        self.assertIn('Players on another region are not listed.', r['help'])
+        self.assertEqual(m.labels().index('Server region'), m.labels().index('Play online in') + 1)
+        m.go_to('Server region')
+        for value, saved in (('EU', 'eu'), ('NA East', 'na-east'), ('South America', 'sa'), ('Auto (EU, 24 ms)', 'auto')):
+            m.key('RIGHT')
+            self.assertEqual((m.row('Server region')['value'], m.file('config/server_region.txt')), (value, saved))
+        m.key('LEFT')
+        self.assertEqual((m.row('Server region')['value'], m.file('config/server_region.txt')), ('South America', 'sa'))
+        self.assertIn('Restart now', m.labels())   # (the next start plays there)
+        m.key('ESC')
+        m.key('ESC')   # (opened again: read from the file)
+        self.assertEqual(m.row('Server region')['value'], 'South America')
+
+    def test_the_file_as_it_is_read(self):
+        for text, value in (('NA-East\n', 'NA East'), ('# mine\neu\n', 'EU'), ('moon\n', 'Auto (NA East, 31 ms)'), ('auto\n', 'Auto (NA East, 31 ms)')):
+            m = self.online(files={'config/server_region.txt': text, 'config/server_region_auto.txt': 'na-east 31 1700000000\n'})
+            self.assertEqual(m.row('Server region')['value'], value, text)
+
+    def test_auto_not_measured_yet(self):
+        m = self.online(files={'config/keep.txt': ''})   # (the folder, no pick kept: asked in the background, shown when known)
+        self.assertIn(m.row('Server region')['value'], ('Auto', 'Auto (EU, 24 ms)'))
+        self.assertTrue(until(lambda: (m.file('config/server_region_auto.txt') or '').startswith('eu 24 '), 5))   # (kept for the next start)
+
+    def test_only_with_the_official_lobby(self):
+        for server, shown in (('auto', True), ('auto friends', True), ('eu.lobby.opensmashultimate.com:39421 friends', True),
+                              ('na.lobby.opensmashultimate.com:39421', True), ('off', False), ('lan', False), ('10.0.0.2:39420', False)):
+            m = self.online(server)
+            self.assertEqual('Server region' in m.labels(), shown, server)
+
+    def test_an_install_with_its_own_official_server(self):
+        m = self.online(files={'config/server_region.txt': 'na-east\n'}, SSBU_OFFICIAL_LOBBY='lobby.example:39421')
+        r = m.row('Server region')
+        self.assertEqual((r['value'], r['kind']), ('lobby.example:39421', 0))   # (said, not a choice)
+        self.assertIn('no regions', r['help'])
+        m = self.online(files={'config/official_lobby.txt': 'lobby.example:39421\n'})
+        self.assertEqual(m.row('Server region')['value'], 'lobby.example:39421')
+
+
 class Version2(MenuTest):
     """Netplay version 2, the default: the page says what version 3 would have, and sends nothing."""
     def test_needs_version_3(self):
@@ -809,6 +948,7 @@ class Version2(MenuTest):
         self.assertNotIn(R.MATCH, lobby.kinds(0.1))
 
     def test_lobby_of_version_2(self):
+        need_lobby()
         server = Server(make=V2OnlyLobby)
         self.addCleanup(server.stop)
         m = self.menu(f'127.0.0.1:{server.port}', protocol=3)
@@ -858,28 +998,28 @@ class Rooms(MenuTest):
         rows = {r['label']: r for r in m.rows()}
         self.assertEqual([(k, rows[k]['value']) for k in ('Alpha (you)', 'Bravo', 'Golf', 'Charlie', 'Delta', 'Echo', 'Foxtrot')],
                          [('Alpha (you)', '1/4 players, open'), ('Bravo', '2/4 players, open - A: join'), ('Golf', '4/4 players, full or closed'),
-                          ('Charlie', "can't join: update your WindowSmash"), ('Delta', "can't join: their WindowSmash is older"),
+                          ('Charlie', "can't join: update your OpenSmash"), ('Delta', "can't join: their OpenSmash is older"),
                           ('Echo', "can't join: another game version"), ('Foxtrot', "can't join: other mods")])
-        game = f'Game build {BUILD[:8]} (yours too), WindowSmash simulation version {SIM} (yours too), netplay version 3'
+        game = f'Game build {BUILD[:8]} (yours too), OpenSmash simulation version {SIM} (yours too), netplay version 3'
         self.assertEqual(rows['Bravo']['help'], "Bravo's room, 2 of 4 players. A: put it first in Local Wireless > Rooms List, then close this menu "
                                                 f"and pick it there. / {game} / Mods: none")   # (the room's game and mods, against yours)
         self.assertIn(f'Game build {OTHER_BUILD[:8]} (yours {BUILD[:8]})', rows['Echo']['help'])
         self.assertIn(f'simulation version {SIM + 1} (yours {SIM})', rows['Charlie']['help'])
         self.assertIn(f'simulation version is {SIM + 1}, yours {SIM}', rows['Charlie']['help'])
-        self.assertIn('Yours is the older one: update WindowSmash to join.', rows['Charlie']['help'])
+        self.assertIn('Yours is the older one: update OpenSmash to join.', rows['Charlie']['help'])
         self.assertIn('Theirs is the older one: the host needs to update.', rows['Delta']['help'])
         self.assertIn(f'build {OTHER_BUILD[:8]}, yours {BUILD[:8]}', rows['Echo']['help'])
         self.assertEqual(rows['Foxtrot']['help'], f"Mods you don't have: Alpha / {game} / Mods: Alpha (you don't have it)")
         for label, said in (('Bravo', "Bravo's room comes first now: close this menu, then Local Wireless > Rooms List"),
                             ('Alpha (you)', 'This is your own room'),
                             ('Golf', "Golf's room is full or closed for now"),
-                            ('Charlie', "Can't join Charlie's room: update your WindowSmash")):
+                            ('Charlie', "Can't join Charlie's room: update your OpenSmash")):
             m.go_to(label)
             m.key('ENTER')
             self.assertEqual(m.toast(), said)
         self.assertEqual(m.page()[0], 1)   # (the menu stays open)
         m.go_to('Charlie')   # (its help's second line on a line of its own)
-        self.assertTrue(any('needs updating) / Yours is the older one: update WindowSmash to join.' in line for line in m.draw()))
+        self.assertTrue(any('needs updating) / Yours is the older one: update OpenSmash to join.' in line for line in m.draw()))
 
     def test_many_rooms_paged_and_picked(self):
         """More rooms than a page: 30 at a time, More/Earlier rooms; A on one puts it first in the game's Rooms List
@@ -997,8 +1137,9 @@ class Matchmaking(MenuTest):
         self.assertEqual(m.labels()[:3], ['Lobby', 'Find a match', 'Rooms'])
 
 
+@unittest.skipUnless(HAVE_LOBBY, NO_LOBBY)
 class RealLobby(MenuTest):
-    """Menus against tools/ssbu_relay.py."""
+    """Menus against the real lobby."""
     def setUp(self):
         super().setUp()
         self.server = Server(search_for=30.0, match_for=30.0, listed_for=60.0)
@@ -1042,7 +1183,7 @@ class RealLobby(MenuTest):
         rows = m.rows()
         got = {r['label']: r['value'] for r in rows if r['id'] >= 60}
         self.assertEqual([r['label'] for r in rows if r['id'] >= 60][0], 'Same')   # (the rooms of this game's key first)
-        self.assertEqual(got, {'Same': '1/8 players, open - A: join', 'Newer': "can't join: update your WindowSmash", 'Modded': "can't join: other mods",
+        self.assertEqual(got, {'Same': '1/8 players, open - A: join', 'Newer': "can't join: update your OpenSmash", 'Modded': "can't join: other mods",
                                'Older': "can't join: another game version"})
 
 

@@ -36,6 +36,9 @@ int pad_gc_switch(void);                                  /* 1: GameCube adapter
 /* Rumble on one side (1 left, 2 right) of a slot's pad, amplitude 0..1. */
 void pad_rumble(u32 slot, int side, float amplitude);
 float pad_rumble_value(u32 slot, int side);               /* what was last sent */
+/* The game's whole vibration value for one side (0 left, 1 right) of a slot's pad: amplitude low, frequency low,
+ * amplitude high, frequency high (nn::hid::VibrationValue). Pads that play HD rumble take it (padble.h). */
+void pad_vibration(u32 slot, int side, const float v[4]);
 int pad_describe(char *buf, int size);                    /* "1 DualSense, 2 Xbox" for the F2 panel */
 
 /* The settings menu (gpu_menu.c). A pad as it is set up now: its settings in effect (from the
@@ -56,6 +59,8 @@ typedef struct PadInfo {
     char map[16][40];
     u32 raw;
     int dz_default;            /* its dead zone is the unchosen default (a GameCube adapter in 1:1 mode uses none then) */
+    int pc_mode;               /* a GameCube adapter in PC mode (read by SDL): gc_switch estimates the console's sticks for it */
+    int pc_scaled;             /* ... and it does so now (no dead zone or outer zone of the player's own) */
     int gc;                    /* it plays as a GameCube controller (its L / R press point is the game's own)*/
     int usb_port;              /* the GameCube-adapter port it is read over (0-3), -1 not one */
     i32 axis[6];               /* the device's own stick/trigger values, as last read (lx, ly, rx, ry, lt, rt) */

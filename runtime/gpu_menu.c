@@ -47,7 +47,6 @@ void gfx_closing(void); /* (gpu_d3d11.c) the game is about to end */
 int gfx_adapter_names(char names[][64], int max); /* (gpu_d3d11.c) the graphics cards, fastest first */
 #endif
 
-#define PUBLIC_LOBBY "opensmash-lobby.duckdns.org:39421" /* (the one public lobby: net_relay.c) */
 
 static volatile int open_, releasing;
 int menu_is_open(void) { return open_; }
@@ -66,12 +65,8 @@ void menu_toast(const char *text)
     ReleaseSRWLockExclusive(&toast_lock);
 }
 
-const char *net_notice_take(void);   /* (net_relay.c: a message for the screen, once) */
 int menu_visible(void)
 {
-    const char *notice = net_notice_take();
-    if (notice)
-        menu_toast(notice);
     return open_ || (toast_until && (toast_until == 1 || GetTickCount64() < toast_until)); }
 
 /* ---- keys from the window's thread ---------------------------------------------------- */
@@ -145,11 +140,12 @@ enum
     P_INPUTS,
     P_CUSTOM,
     P_ASSIGN,
+    P_CTRLS,
     PAGES = P_REMAP
 }; /* (the pad's buttons, the keyboard's keys, the pad's sticks: no key of their own) */
-#define SUB_PAGE(p) ((p) == P_REMAP || (p) == P_KEYS || (p) == P_STICKS || (p) == P_RUMBLE || (p) == P_INPUTS || (p) == P_CUSTOM || (p) == P_ASSIGN) /* (a page of the Controllers page's) */
+#define SUB_PAGE(p) ((p) == P_REMAP || (p) == P_KEYS || (p) == P_STICKS || (p) == P_RUMBLE || (p) == P_INPUTS || (p) == P_CUSTOM || (p) == P_ASSIGN || (p) == P_CTRLS) /* (a page of the Controllers page's) */
 /* Where B / Backspace and the Back rows go from a page of the Controllers page's: Buttons, Sticks and Rumble are inside Customize controller. */
-#define PARENT_PAGE(p) ((p) == P_REMAP || (p) == P_STICKS || (p) == P_RUMBLE || (p) == P_INPUTS ? P_CUSTOM : P_PADS)
+#define PARENT_PAGE(p) ((p) == P_REMAP || (p) == P_STICKS || (p) == P_RUMBLE || (p) == P_INPUTS ? P_CUSTOM : (p) == P_CUSTOM ? P_CTRLS : P_PADS)
 static const char *const PAGE_NAMES[PAGES] = {"Display", "Controllers", "Online", "Game", "Lobby", "Mods", "Experimental"};
 enum { K_INFO, K_CHOICE, K_ACTION, K_TEXT };
 enum { W_NONE, W_NOW, W_RESTART };
@@ -161,17 +157,18 @@ enum {
     R_NET_STATUS, R_NET_MODE, R_NET_CODE, R_NET_SERVER, R_NET_NAME, R_NET_DIRECT, R_NET_PROTOCOL,
     R_LOBBY, R_MATCH_FIND, R_MATCH_CANCEL, R_ROOMS,
     R_UI_LANGUAGE, R_LANGUAGE, R_VOLUME, R_UW_ONLINE, R_OPEN_LOGS, R_RESTART, R_QUIT, R_REMAP_BACK, R_MODS_STATE, R_MOD_CODE, R_MODS_OFF, R_LAN_ROOMS,
-    R_KEYS, R_KEYS_BACK, R_KEYS_RESET, R_RENDERER, R_ROOMS_PREV, R_ROOMS_NEXT, R_ROOMS_GAME_PAGE, R_RUNAHEAD, R_NET_ROLLBACK, R_NET_DELAY,
+    R_KEYS, R_KEYS_BACK, R_KEYS_RESET, R_RENDERER, R_ROOMS_PREV, R_ROOMS_NEXT, R_ROOMS_GAME_PAGE, R_RUNAHEAD, R_NET_ROLLBACK, R_NET_DELAY, R_NET_REGION,
+    R_FRAMERATE, R_MOTION,
     R_PADSEL_FIRST = 300, /* + the controller's place (PAD_SLOTS at most): opens its settings */
     R_REMAP_FIRST = 100,  /* + console button */
     R_MOD_FIRST = 200,    /* + the mod's place in mods.json (MENU_MODS at most) */
     R_KEY_FIRST = 400,    /* + the keyboard binding (PAD_KEYS) */
     R_OSK = 500,          /* the game's own text box (menu_osk_run) */
     /* (after the ranges above) */
-    R_ASSIGN, R_ASSIGN_BACK, R_ASSIGN_WAIT, R_REMAP_RESET, R_STICKS_RESET, R_RUMBLE_RESET,
+    R_ASSIGN, R_ASSIGN_BACK, R_ASSIGN_WAIT, R_REMAP_RESET, R_STICKS_RESET, R_RUMBLE_RESET, R_CTRLS, R_CTRLS_BACK,
     R_ROOM_FIRST = 600    /* + the room's place on the page of rooms shown (ROOM_PAGE at most); the plain ids before R_REMAP_FIRST (100) stay under it */
 };
-_Static_assert(R_NET_DELAY < R_REMAP_FIRST, "the plain row ids must stay under R_REMAP_FIRST");
+_Static_assert(R_MOTION < R_REMAP_FIRST, "the plain row ids must stay under R_REMAP_FIRST");
 #define IS_KEY(id) ((id) >= R_KEY_FIRST && (id) < R_KEY_FIRST + PAD_KEYS)
 #define IS_REMAP(id) ((id) >= R_REMAP_FIRST && (id) < R_REMAP_FIRST + 16)
 
@@ -189,6 +186,10 @@ enum
 }; /* (the Mods page: a row a mod, MENU_MODS at most) */
 static Row rows[MENU_ROWS];
 static int nrows;
+#define R_ADVANCED (-9) /* the Display page's switch: the rows few people touch, shown or not */
+static int show_advanced;
+#define R_HEADER (-8) /* a slim row naming a section of the page (a line beside its name); not a row to choose */
+#define R_SPACER (-7) /* an empty row between the rows that can be chosen and those that cannot (a line across it) */
 
 static Row *add(int id, int kind, int when, const char *label, const char *help)
 {
@@ -203,7 +204,7 @@ static Row *add(int id, int kind, int when, const char *label, const char *help)
 }
 
 /* ---- state ---------------------------------------------------------------------------- */
-static int page, sel[P_ASSIGN + 1], top[P_ASSIGN + 1];
+static int page, sel[P_CTRLS + 1], top[P_CTRLS + 1];
 static int pad_slot = -1;           /* the pad the Controllers page sets up */
 static int confirm;                 /* a row asking yes or no */
 static int foot, foot_page;         /* the cursor on Restart game (1) or Quit game (2), under foot_page's rows */
@@ -237,9 +238,11 @@ static int trigger_default(const PadInfo *p) { return pad_is_gc(p) ? GC_TRIGGER_
 static char pins[PAD_SLOTS][128]; /* controllers.ini's [players], read at the menu's opening and changes */
 static int rumble_slot = -1;
 static ULONGLONG rumble_stop;
-static char version[64];
+static char version[64], source_version[64], launcher_version[64];   /* (the Info page: the game's, the recomp sources', the launcher's) */
 static char gpus[8][64];
 static int ngpus;
+static int wheel_free_sel = -1, wheel_free_page = -1; /* the wheel moved the view off the cursor: the row it left, so drawing does not pull the view back */
+static int rows_page = -1; /* the page the rows[] are of (the cursor of that page counts the empty rows in them) */
 static int built_page = -1; /* the page build() made last (-1: none since the menu opened) */
 /* The game's software keyboard (nn::swkbd, hle_applet.c) typed on the text grid: asked from the game's
  * thread (menu_osk_run), opened and answered here. 0 none, 1 asked, 2 open, 3 done, 4 cancelled. */
@@ -249,7 +252,9 @@ static int osk_max = 32, osk_min, osk_scripted; /* (osk_scripted: SSBU_MENU_OSK'
 
 static struct { int mode; char custom[128], code[40], name[40]; int direct, protocol, rollback; } net;
 enum { NET_PUBLIC, NET_PRIVATE, NET_CUSTOM, NET_OFFLINE, NET_LAN, NET_MODE_COUNT };
-static const char *const NET_MODES[NET_MODE_COUNT] = {"public lobby (Europe)", "private lobby (a code)", "your own server", "offline",
+/* (the first choice is the official lobby: relay only, one server a region - net_region.c. OpenSmash 0.5.0: Epic Online
+ * Services are gone, and an "eos" line in online_server.txt reads as the official lobby, net_relay.c) */
+static const char *const NET_MODES[NET_MODE_COUNT] = {"official lobby (relay only, EU / NA East / SA)", "private lobby (a code)", "your own server", "offline",
                                                       "this network (LAN)"};
 
 static void net_load(void)
@@ -263,9 +268,8 @@ static void net_load(void)
         net.mode = NET_OFFLINE;
     else if (!_stricmp(host, "lan"))
         net.mode = NET_LAN; /* (net_relay.c's LAN discovery) */
-    else if (!_stricmp(host, "auto") || !_stricmp(host, "na") || !_stricmp(host, "eu") || !_strnicmp(host, "smash.recomps.wtf", 17) ||
-             !_stricmp(host, PUBLIC_LOBBY))
-        net.mode = code[0] ? NET_PRIVATE : NET_PUBLIC; /* (the one public lobby; the North American one is gone: net_relay.c) */
+    else if (net_means_official_lobby(host)) /* ("auto", the official lobby's name, an older public lobby's, "eos": net_relay.c) */
+        net.mode = code[0] ? NET_PRIVATE : NET_PUBLIC; /* (the official lobby; which region's: net_region.c) */
     else
     {
         net.mode = NET_CUSTOM;
@@ -294,25 +298,63 @@ static void net_save_server(void)
     {
         if (!net.code[0])
             snprintf(net.code, sizeof net.code, "friends");
-        snprintf(line, sizeof line, "%s %s", PUBLIC_LOBBY, net.code);
+        snprintf(line, sizeof line, "auto %s", net.code);   /* (v0.5.0: "auto" is the official lobby, net_relay.c) */
     }
     else
         snprintf(line, sizeof line, "%s%s%s", net.custom[0] ? net.custom : "127.0.0.1:39420", net.code[0] ? " " : "", net.code);
     settings_line_write(config_path(CONFIG_ONLINE_SERVER), line);
 }
 
-static void load_version(void)
+/* the first line of <the port's folder>/<rel>, or "" */
+static void first_line(const char *rel, char *out, size_t size)
 {
     char path[600];
-    snprintf(path, sizeof path, "%s/../../version.txt", rt_data_dir ? rt_data_dir : ".");
-    version[0] = 0;
+    snprintf(path, sizeof path, "%s/../../%s", rt_data_dir ? rt_data_dir : ".", rel);
+    out[0] = 0;
     FILE *f = fopen(path, "r");
     if (f)
     {
-        if (fgets(version, sizeof version, f))
-            version[strcspn(version, "\r\n")] = 0;
+        if (fgets(out, (int)size, f))
+            out[strcspn(out, "\r\n")] = 0;
         fclose(f);
     }
+}
+
+static int hex40(const char *t)
+{
+    int n = 0;
+    while (n < 40 && ((t[n] >= '0' && t[n] <= '9') || (t[n] >= 'a' && t[n] <= 'f') || (t[n] >= 'A' && t[n] <= 'F'))) n++;
+    return n == 40;
+}
+
+static void load_version(void)
+{
+    first_line("version.txt", version, sizeof version);
+    /* the recomp's sources: tools/source_version.txt "<commit> <date>" (a release ZIP and the updater write it); in a git
+     * checkout (still "$Format..."), .git/HEAD's commit, or its branch's */
+    char line[128];
+    first_line("tools/source_version.txt", line, sizeof line);
+    source_version[0] = 0;
+    if (hex40(line))
+        snprintf(source_version, sizeof source_version, "%.7s%s", line, line[40] == ' ' ? line + 40 : "");
+    else
+    {
+        first_line(".git/HEAD", line, sizeof line);
+        if (hex40(line))
+            snprintf(source_version, sizeof source_version, "%.7s (git)", line);
+        else if (!strncmp(line, "ref: refs/heads/", 16))
+        {
+            char ref[160], sha[64];
+            snprintf(ref, sizeof ref, ".git/%s", line + 5);
+            first_line(ref, sha, sizeof sha);
+            if (hex40(sha))
+                snprintf(source_version, sizeof source_version, "%.7s (git, %.40s)", sha, line + 16);
+            else
+                snprintf(source_version, sizeof source_version, "git, %.40s", line + 16);
+        }
+    }
+    const char *lv = getenv("OPENSMASH_LAUNCHER_VERSION");   /* (the launchers set it at Play: OpenSmash.Core.VersionInfo.EnvName) */
+    snprintf(launcher_version, sizeof launcher_version, "%s", lv && *lv ? lv : "");
 }
 
 static void load_pins(void);
@@ -455,7 +497,7 @@ static void lan_row(int looking)
             snprintf(r->value + strlen(r->value), sizeof r->value - strlen(r->value), ui_text(" (and %d of another version)"), others);
         help_set(r, "Private rooms hosted on this network by games of your version, heard now. The game joins the first one by itself "
                     "(Online > Now says which), and the next one if that host leaves.%s",
-                 others ? "\nThe others are of another game or WindowSmash version, or of another room code: they can't be joined." : "");
+                 others ? "\nThe others are of another game or OpenSmash version, or of another room code: they can't be joined." : "");
     }
     else if (lan == NET_LAN_ANNOUNCING)
     {
@@ -532,7 +574,7 @@ static void match_rows(void)
             snprintf(r->value, sizeof r->value, "asking the lobby...");
         else
             snprintf(r->value, sizeof r->value, "searching... %d:%02d", waited / 60, waited % 60);
-        help_set(r, "Searching for another player of your game, WindowSmash and mods, with your lobby code. You can close this menu "
+        help_set(r, "Searching for another player of your game, OpenSmash and mods, with your lobby code. You can close this menu "
                     "and play meanwhile: a message says when a match is found.");
         break;
     case NET_MATCH_MATCHED:
@@ -556,7 +598,7 @@ static void match_rows(void)
         break;
     case NET_MATCH_TIMEOUT:
         snprintf(r->value, sizeof r->value, "no opponent found in time");
-        help_set(r, "Nobody of your game, WindowSmash, mods and lobby code searched in time. A: search again.");
+        help_set(r, "Nobody of your game, OpenSmash, mods and lobby code searched in time. A: search again.");
         break;
     case NET_MATCH_LEFT:
         snprintf(r->value, sizeof r->value, "%.32s cancelled or left", other);
@@ -572,7 +614,7 @@ static void match_rows(void)
         break;
     default:
         snprintf(r->value, sizeof r->value, "not searching");
-        help_set(r, "Pairs you with another player of your game, WindowSmash and mods, with your lobby code, and says who hosts. A: "
+        help_set(r, "Pairs you with another player of your game, OpenSmash and mods, with your lobby code, and says who hosts. A: "
                     "search. You can close this menu meanwhile: a message says when a match is found.");
     }
     if (m->state == NET_MATCH_ASKING || m->state == NET_MATCH_SEARCHING || m->state == NET_MATCH_MATCHED)
@@ -665,7 +707,7 @@ static const char *room_short(const NetRoom *x)
     if (x->why_kind == NET_WHY_BUILD)
         return "another game version";
     if (x->why_kind == NET_WHY_SIM)
-        return x->sim > SIM_VERSION ? "update your WindowSmash" : "their WindowSmash is older";
+        return x->sim > SIM_VERSION ? "update your OpenSmash" : "their OpenSmash is older";
     return "other mods";
 }
 
@@ -703,7 +745,7 @@ static void room_rows(void)
         if (!x->joinable)
         {
             snprintf(r->value, sizeof r->value, ui_text("can't join: %s"), room_short(x));
-            help_set(r, "%s%s\n%s", x->why, x->why_kind != NET_WHY_SIM ? "" : x->sim > SIM_VERSION ? "\nYours is the older one: update WindowSmash to join."
+            help_set(r, "%s%s\n%s", x->why, x->why_kind != NET_WHY_SIM ? "" : x->sim > SIM_VERSION ? "\nYours is the older one: update OpenSmash to join."
                                                                                                    : "\nTheirs is the older one: the host needs to update.",
                      x->details);
             continue;
@@ -739,8 +781,7 @@ static void room_rows(void)
 }
 
 /* The Lobby page's rows (fresh: the page shows anew, so the rooms are asked for again). */
-/* The yuzu-compatible client (net_yuzu.c, SSBU_NET_BACKEND=yuzu): its backend is net_backend_candidate. Online through
- * Epic Online Services net_backend is net_eos_backend (net_relay.c), which keeps every OpenSmash page: issue #389. */
+/* The yuzu-compatible client (net_yuzu.c, SSBU_NET_BACKEND=yuzu): its backend is net_backend_candidate. */
 static int yuzu_client(void) { return net_backend && net_backend == net_backend_candidate; }
 
 static void build_lobby(int fresh)
@@ -816,7 +857,7 @@ static void build_lobby(int fresh)
             snprintf(r->value, sizeof r->value, ui_text(match.players == 1 ? "%d player, %d searching" : "%d players, %d searching"), match.players, match.searching);
         else
             snprintf(r->value, sizeof r->value, ui_text("version 3"));
-        r->help = "The players of your lobby code who can play with you (the same game, WindowSmash and mods), and how many of them "
+        r->help = "The players of your lobby code who can play with you (the same game, OpenSmash and mods), and how many of them "
                   "are searching for a match.";
     }
     if (st == LB_ON)
@@ -900,6 +941,19 @@ static void build(void)
     int same = built_page == page, was = same && sel[page] < nrows ? rows[sel[page]].id : R_NONE;
     u32 was_host = IS_ROOM(was) ? ROOM_AT(was)->host : 0;
     built_page = page;
+    { /* the cursor's index without the empty rows build() adds under the page (at its end) between choosable and other rows:
+       * taken off the page the rows are of (the one built last), also when the page has changed or the menu was closed since */
+        int before = 0;
+        if (rows_page >= 0)
+        {
+            for (int k = 0; k < sel[rows_page] && k < nrows; k++)
+                before += rows[k].id == R_SPACER; /* (the Display page's headings are rows of its own, kept in the index) */
+            sel[rows_page] -= before;
+        }
+        rows_page = page;
+    }
+    if (!same)
+        wheel_free_page = -1; /* (a page shown again, or the menu opened again: the view follows the cursor) */
     nrows = 0;
     Row *r;
     DisplaySettings ds;
@@ -921,6 +975,17 @@ static void build(void)
         snprintf(r->value, sizeof r->value, "%s", ds.pacing == PACING_VRR ? "vrr" : ds.pacing == PACING_DISPLAY ? "display"
                                                                                                                 : "clock");
         note_env(r, "SSBU_PACING");
+        r = add(R_FRAMERATE, K_CHOICE, W_NOW, "Frame rate",
+                "How many frames a second the game draws and reads the controllers: 60, 120 or 240. Its logic stays at 60, so it plays at "
+                "its normal speed (240 keeps Steve's NIL timing as at 60). Online matches run at 60. The PC must keep up: a missed frame is a slowdown.");
+        snprintf(r->value, sizeof r->value, "%d", display_frame_rate());
+        note_env(r, "SSBU_FRAME_RATE");
+        r = add(R_MOTION, K_CHOICE, W_NOW, "Motion between frames",
+                "With 120 or 240 frames a second: the pictures between two game frames show the characters and the camera moving "
+                "instead of standing still. The game and its timing are the same. Interpolate: smooth, as delayed as 60 frames a "
+                "second at most. Extrapolate: no delay, may overshoot a little when something turns at once. Off: as the game draws it.");
+        { int mo = display_motion(); snprintf(r->value, sizeof r->value, "%s", mo == 2 ? "extrapolate" : mo == 1 ? "interpolate" : "off"); }
+        note_env(r, "SSBU_MOTION");
         r = add(R_LATENCY, K_CHOICE, W_NOW, "Frames queued ahead", "How many frames the graphics card may work ahead: 1 is the most responsive, 3 the smoothest on a busy PC. "
                 "Vulkan keeps 2 at least (with 1 the processor and the card wait for each other every frame).");
         snprintf(r->value, sizeof r->value, "%d", ds.latency);
@@ -1003,7 +1068,7 @@ static void build(void)
 #ifdef _WIN32
                 "auto: Vulkan on an AMD, NVIDIA or Intel card (no first-use stutter there), Direct3D 11 on any other. direct3d11 or vulkan: that one on any card."
                 " If Vulkan cannot start (its shaders come from ssbu_glslang.dll beside the game, which needs the Visual C++ runtime), or"
-                " stopped the game in its first seconds twice in a row, Direct3D 11 draws and the log says why."
+                " stopped the game in its first seconds twice in a row, or lost the graphics device with this driver, Direct3D 11 draws and the log says why."
 #else
                 "DXVK: Direct3D 11 on Vulkan, the renderer the game is played and tested with. Vulkan: in development; until it can draw the game, "
                 "the game checks Vulkan at its start, says what it found in its log, and draws as before."
@@ -1027,19 +1092,8 @@ static void build(void)
         }
         else
         {
-            for (int s = 0; s < PAD_SLOTS; s++) /* a row a connected controller; A / Enter opens its settings */
-            {
-                if (!pads[s].connected)
-                    continue;
-                char label[24];
-                if (pads[s].slot >= 0)
-                    snprintf(label, sizeof label, "Player %d", pads[s].slot + 1);
-                else
-                    snprintf(label, sizeof label, "No player");
-                r = add(R_NONE, K_INFO, W_NONE, label, "A controller that is connected. Choose Customize controller... under it to set it up.");
-                snprintf(r->value, sizeof r->value, "%.80s", pads[s].name);
-                add(R_PADSEL_FIRST + s, K_ACTION, W_NONE, "    Customize controller...", "This controller's buttons, sticks and rumble.");
-            }
+            r = add(R_CTRLS, K_ACTION, W_NONE, "Customize controllers...", "Each connected controller's buttons, sticks and rumble: one row a controller.");
+            snprintf(r->value, sizeof r->value, "%d connected", npads_connected);
         }
         if (npads_connected >= 2) /* (one controller has nothing to switch) */
             add(R_ASSIGN, K_ACTION, W_NONE, "Switch player...", "Choose which controller is player 1, 2, 3 ...: press A on each, in order.");
@@ -1054,6 +1108,22 @@ static void build(void)
         snprintf(r->value, sizeof r->value, "%s", on_off(pad_background()));
         r = add(R_PADS_FILE, K_ACTION, W_NONE, "Open controllers.ini", "Everything else, by hand: settings per kind of pad, more remaps. Changes there count at the next start.");
         snprintf(r->value, sizeof r->value, "%s", pad_ini_path());
+        break;
+    case P_CTRLS:
+        r = add(R_CTRLS_BACK, K_ACTION, W_NONE, "< Back", "Back to the controllers.");
+        snprintf(r->value, sizeof r->value, "Controllers");
+        for (int s = 0; s < PAD_SLOTS; s++) /* a row a connected controller; A / Enter opens its settings */
+        {
+            if (!pads[s].connected)
+                continue;
+            char label[24];
+            if (pads[s].slot >= 0)
+                snprintf(label, sizeof label, "Player %d", pads[s].slot + 1);
+            else
+                snprintf(label, sizeof label, "No player");
+            r = add(R_PADSEL_FIRST + s, K_ACTION, W_NONE, label, "This controller's buttons, sticks and rumble.");
+            snprintf(r->value, sizeof r->value, "%.80s", pads[s].name);
+        }
         break;
     case P_CUSTOM:
     {
@@ -1132,21 +1202,23 @@ static void build(void)
         snprintf(r->value, sizeof r->value, "Customize controller");
         PadUsbAxes ua;
         int have_ua = pad && pad->usb_port >= 0 && padusb_axes(pad->usb_port, &ua);
-        if (have_ua) /* (a GameCube adapter: Windows' own reader, hle_padusb.c) */
+        if (have_ua || (pad && pad->pc_mode)) /* (a GameCube adapter: Windows' own reader, hle_padusb.c; or in PC mode, read by SDL) */
         {
             r = add(R_GC_SWITCH, K_CHOICE, W_NOW, "GameCube stick scaling",
-                    "1:1 Switch: the same numbers a Switch console uses for this adapter, no dead zone. OpenSmash original: the earlier scaling, with a dead zone and a reach that adjusts to your stick. Applies to all GameCube adapters.");
+                    have_ua ? "1:1 Switch: the same numbers a Switch console uses for this adapter, no dead zone. OpenSmash original: the earlier scaling, with a dead zone and a reach that adjusts to your stick. Applies to all GameCube adapters."
+                            : "1:1 Switch: an estimate of the numbers a Switch console uses (this adapter in PC mode scales the sticks itself; the Wii U mode is exact), no dead zone. OpenSmash original: the earlier scaling, with a dead zone. Applies to all GameCube adapters.");
             snprintf(r->value, sizeof r->value, "%s", pad_gc_switch() ? "1:1 Switch" : "OpenSmash original");
             note_env(r, "SSBU_GC_SWITCH");
-            add(R_PAD_RECAL, K_ACTION, W_NOW, "Recalibrate sticks",
-                "Measures the sticks' centre and reach again: let go of the sticks and triggers, then A or Enter. "
-                "(They are measured as the controller is plugged in, too.)");
+            if (have_ua)
+                add(R_PAD_RECAL, K_ACTION, W_NOW, "Recalibrate sticks",
+                    "Measures the sticks' centre and reach again: let go of the sticks and triggers, then A or Enter. "
+                    "(They are measured as the controller is plugged in, too.)");
         }
         if (pad)
         {
             r = add(R_PAD_DEADZONE, K_CHOICE, W_NOW, "Stick dead zone", "How much of the sticks' travel around the centre is ignored: raise it if a worn stick drifts.");
             snprintf(r->value, sizeof r->value, "%d%%", pad->deadzone);
-            if (pad->usb_port >= 0 && pad_gc_switch() && pad->dz_default)
+            if ((pad->usb_port >= 0 && pad_gc_switch() && pad->dz_default) || pad->pc_scaled)
                 snprintf(r->value, sizeof r->value, "none (1:1 Switch)"); /* (the default 10 stands aside there; another value counts) */
             r = add(R_PAD_STICKTAUNT, K_CHOICE, W_NOW, "Stick taunts", "On: the left stick's four directions press the taunt buttons and the stick no longer moves (use with D-pad moves). Off: the stick is the stick.");
             snprintf(r->value, sizeof r->value, "%s", on_off(pad->stick_taunts));
@@ -1251,7 +1323,7 @@ static void build(void)
                                                                                             : "offline");
         if (yuzu_client())
         {
-            r = add(R_NET_MODE, K_INFO, W_NONE, "Connection", "Change the room server and nickname using Join yuzu Room.bat.");
+            r = add(R_NET_MODE, K_INFO, W_NONE, "Connection", "Change the room server and nickname in the launcher: Settings > Yuzu room.");
             snprintf(r->value, sizeof r->value, ui_text("yuzu compatible (client)"));
             r = add(R_NET_NAME, K_INFO, W_NONE, "Your name", "The nickname used to join this existing room server.");
             snprintf(r->value, sizeof r->value, "%s", net_player_name());
@@ -1260,7 +1332,8 @@ static void build(void)
             break;
         }
         r = add(R_NET_MODE, K_CHOICE, W_RESTART, "Play online in",
-                "Public lobby: everyone's rooms in Local Wireless. Private: only players with the same code. Your own server: host:port. "
+                "Official lobby: everyone's rooms on your region's server (EU / NA East / SA); every match is relayed, so no player's address reaches another. "
+                "Private: only players with the same code. Your own server: host:port. "
                 "Offline: no netplay. This network: a private room hosted on your local network, found by itself.");
         snprintf(r->value, sizeof r->value, "%s", ui_text(NET_MODES[net.mode]));
         if (net.mode == NET_PRIVATE || net.mode == NET_CUSTOM)
@@ -1273,10 +1346,27 @@ static void build(void)
             r = add(R_NET_SERVER, K_TEXT, W_RESTART, "Server", "The lobby server's address and port, e.g. 192.168.1.20:39420.");
             snprintf(r->value, sizeof r->value, "%s", net.custom[0] ? net.custom : "(none)");
         }
+        if (net.mode == NET_PUBLIC || net.mode == NET_PRIVATE)
+        { /* (the official lobbies, one a region: net_region.c; config/server_region.txt, the launcher's too) */
+            int other = 0, region = net_region_setting(&other), ms = -1, pick = other || region >= 0 ? -1 : net_region_auto(&ms);
+            r = add(R_NET_REGION, other ? K_INFO : K_CHOICE, other ? W_NONE : W_RESTART, "Server region",
+                    other ? "This install names its own official server (config/official_lobby.txt or SSBU_OFFICIAL_LOBBY): no regions."
+                          : "The official server you play on. Auto: the closest one (the lowest ping). Players on another region are not listed.");
+            if (other)
+                snprintf(r->value, sizeof r->value, "%.60s", net_official_lobby());
+            else if (region >= 0)
+                snprintf(r->value, sizeof r->value, "%s", NET_REGIONS[region].label);
+            else if (pick >= 0 && ms >= 0)
+                snprintf(r->value, sizeof r->value, "Auto (%s, %d ms)", NET_REGIONS[pick].label, ms);
+            else if (pick >= 0)
+                snprintf(r->value, sizeof r->value, "Auto (%s)", NET_REGIONS[pick].label);
+            else
+                snprintf(r->value, sizeof r->value, "%s", ui_text("Auto"));
+        }
         r = add(R_NET_NAME, K_TEXT, W_RESTART, "Your name", "What other players see (up to 32 letters).");
         snprintf(r->value, sizeof r->value, "%s", net.name[0] ? net.name : "(picked at the first online start)");
         r = add(R_NET_DIRECT, K_CHOICE, W_RESTART, "Direct connections",
-                "On: rooms connect players directly when they can (less lag). Off: everything goes through the lobby, so other players never learn your internet address.");
+                "Private rooms and This network (LAN) only. On: players connect to each other directly (less lag), and a room on this network is announced. Off: everything goes through the host's game. The official lobbies never use direct connections.");
         snprintf(r->value, sizeof r->value, "%s", on_off(net.direct));
         r = add(R_NET_DELAY, K_CHOICE, W_NOW, "Input delay",
                 "The frames the game's own netcode waits before your inputs count online (Auto: its own choice, from the connection). Fewer frames answer sooner but stutter on a slow connection. Counts from the next match.");
@@ -1352,7 +1442,7 @@ static void build(void)
         snprintf(r->value, sizeof r->value, "%d%%", audio_master_volume());
         note_env(r, "SSBU_VOLUME");
     }
-        add(R_RESTART, K_ACTION, W_NONE, "Restart the game", "Starts the game again (for the settings marked 'next start'). A match in progress is lost.");
+        add(R_RESTART, K_ACTION, W_NONE, "Restart the game", "Starts the game again (for the settings with an amber square). A match in progress is lost.");
         add(R_QUIT, K_ACTION, W_NONE, "Quit the game", "Closes the game. A match in progress is lost.");
 #ifdef __APPLE__
         static const char *const KEYS[][2] = {{"Esc / Home button", "this menu (or hold - and + for a second)"}, {"F1, Cmd+1", "frame rate on / off"}, {"F2, Cmd+2", "details"}, {"F3, Cmd+3", "screenshot (screenshots folder)"}, {"Option+Return", "full screen (or Ctrl+Cmd+F)"}};
@@ -1364,10 +1454,117 @@ static void build(void)
             r = add(R_NONE, K_INFO, W_NONE, KEYS[i][0], "Keys that work while playing.");
             snprintf(r->value, sizeof r->value, "%s", KEYS[i][1]);
         }
-        r = add(R_NONE, K_INFO, W_NONE, "Version", "The game version this folder has (version.txt).");
+        r = add(R_NONE, K_INFO, W_NONE, "Game version", "The game version this folder has (version.txt).");
         snprintf(r->value, sizeof r->value, "%s", version[0] ? version : "unknown (no version.txt)");
+        r = add(R_NONE, K_INFO, W_NONE, "OpenSmash (recomp)", "The OpenSmash commit this folder's sources are at, and its date (tools/source_version.txt).");
+        snprintf(r->value, sizeof r->value, "%s", source_version[0] ? source_version : "unknown");
+        r = add(R_NONE, K_INFO, W_NONE, "Launcher", "The version of the OpenSmash launcher that started the game.");
+        snprintf(r->value, sizeof r->value, "%s", launcher_version[0] ? launcher_version : "not started from the launcher");
         break;
     }
+    static Row packed[MENU_ROWS];
+    int n = 0, cur = sel[page];
+    if (page == P_DISPLAY)
+    { /* the rows in sections, each under a slim name (the page has 12 rows: they are easier to find in groups) */
+        enum { H = 0 };
+        static const struct { int id; const char *name; } ORDER[] = {
+            {H, "Window"}, {R_WINDOW, 0}, {R_SIZE, 0},
+            {H, "Picture"}, {R_SCALE, 0}, {R_ASPECT, 0}, {R_VIEW, 0}, {R_RENDERER, 0}, /* (#429: the renderer in sight, not behind the switch -
+                                                                          * Direct3D 11 is the way out when Vulkan draws wrong on a card) */
+            {H, "Smoothness"}, {R_PACING, 0}, {R_FRAMERATE, 0}, {R_MOTION, 0},
+            {H, "Advanced"}, {R_ADVANCED, 0}, /* (the switch, and under it the rows it shows) */
+            {R_CURSOR, 0}, {R_TIMER, 0}, {R_LATENCY, 0}, {R_RUNAHEAD, 0}, {R_OVERLAY, 0}, {R_GPU, 0}};
+        static unsigned char used[MENU_ROWS];
+        static int adv_loaded;
+        if (!adv_loaded)
+        {
+            char sa[16] = "";
+            adv_loaded = 1;
+            show_advanced = settings_ini_get(display_ini_path(), NULL, "show_advanced", sa, sizeof sa) && atoi(sa) == 1;
+        }
+        memset(used, 0, sizeof used);
+        int pending = -1; /* the section name not yet put down: it goes before the section's first row that exists */
+        for (u32 k = 0; k < sizeof ORDER / sizeof *ORDER; k++)
+        {
+            if (ORDER[k].id == H)
+            {
+                pending = (int)k;
+                continue;
+            }
+            int rare = ORDER[k].id == R_CURSOR || ORDER[k].id == R_TIMER || ORDER[k].id == R_LATENCY || ORDER[k].id == R_RUNAHEAD ||
+                       ORDER[k].id == R_OVERLAY || ORDER[k].id == R_GPU; /* (the rows few people touch: behind the switch) */
+            if (ORDER[k].id == R_ADVANCED && n < MENU_ROWS - 3)
+            { /* the switch */
+                if (pending >= 0)
+                {
+                    memset(&packed[n], 0, sizeof packed[n]);
+                    packed[n].id = R_HEADER;
+                    packed[n].kind = K_INFO;
+                    snprintf(packed[n].label, sizeof packed[n].label, "%s", ui_text(ORDER[pending].name));
+                    n++;
+                    pending = -1;
+                }
+                Row *a = &packed[n++];
+                memset(a, 0, sizeof *a);
+                a->id = R_ADVANCED;
+                a->kind = K_CHOICE;
+                a->when = W_NONE;
+                snprintf(a->label, sizeof a->label, "%s", ui_text("Show advanced settings"));
+                a->help = ui_text("On: shows more rows under this one (the mouse pointer, the timer, frames queued ahead, the frame rate in the corner and the graphics card). Off: only the everyday ones.");
+                snprintf(a->value, sizeof a->value, "%s", on_off(show_advanced));
+                continue;
+            }
+            for (int i = 0; i < nrows && n < MENU_ROWS - 2 && (show_advanced || !rare); i++)
+                if (!used[i] && rows[i].id == ORDER[k].id)
+                {
+                    used[i] = 1;
+                    if (pending >= 0)
+                    {
+                        memset(&packed[n], 0, sizeof packed[n]);
+                        packed[n].id = R_HEADER;
+                        packed[n].kind = K_INFO;
+                        snprintf(packed[n].label, sizeof packed[n].label, "%s", ui_text(ORDER[pending].name));
+                        n++;
+                        pending = -1;
+                    }
+                    packed[n++] = rows[i];
+                    break;
+                }
+        }
+        for (int i = 0; i < nrows && n < MENU_ROWS - 2; i++) /* (any row not in the list: at the end) */
+            if (!used[i])
+            {
+                int rare = rows[i].id == R_CURSOR || rows[i].id == R_TIMER || rows[i].id == R_LATENCY || rows[i].id == R_RUNAHEAD ||
+                           rows[i].id == R_OVERLAY || rows[i].id == R_GPU;
+                if (show_advanced || !rare)
+                    packed[n++] = rows[i];
+            }
+        memcpy(rows, packed, (size_t)n * sizeof *rows);
+        nrows = n;
+        if (same && was != R_NONE)
+            for (int i = 0; i < nrows; i++)
+                if (rows[i].id == was)
+                {
+                    sel[page] = i;
+                    break;
+                }
+        return;
+    }
+    /* an empty row, with a line across it, wherever the rows that can be chosen meet those that cannot */
+    for (int i = 0; i < nrows && n < MENU_ROWS; i++)
+    {
+        if (i > 0 && (rows[i].kind != K_INFO) != (rows[i - 1].kind != K_INFO) && n < MENU_ROWS - 2)
+        {
+            memset(&packed[n], 0, sizeof packed[n]);
+            packed[n].id = R_SPACER;
+            packed[n++].kind = K_INFO;
+            if (i <= cur)
+                sel[page]++;
+        }
+        packed[n++] = rows[i];
+    }
+    memcpy(rows, packed, (size_t)n * sizeof *rows);
+    nrows = n;
 }
 
 static int selectable(const Row *r) { return r->kind != K_INFO; }
@@ -1469,6 +1666,23 @@ static void change(const Row *row, int dir)
                                                                             : "clock");
         break;
     }
+    case R_FRAMERATE:
+    { /* 60, 120, 240: at once (the vsync thread takes it at its next refresh) */
+        static const int RATES[3] = {60, 120, 240};
+        int f = display_frame_rate(), i = cycle(f >= 240 ? 2 : f >= 120 ? 1 : 0, 3, dir);
+        display_set_frame_rate(RATES[i]);
+        snprintf(v, sizeof v, "%d", RATES[i]);
+        set_display("frame_rate", v);
+        break;
+    }
+    case R_MOTION:
+    { /* off, interpolate, extrapolate: at once (gpu_motion.c takes it at the next picture) */
+        static const char *const MODES[3] = {"off", "interpolate", "extrapolate"};
+        int mo = cycle(display_motion(), 3, dir);
+        display_set_motion(mo);
+        set_display("motion", MODES[mo]);
+        break;
+    }
     case R_LATENCY:
         snprintf(v, sizeof v, "%d", cycle(ds.latency - 1, 3, dir) + 1);
         display_set_latency(atoi(v));
@@ -1509,6 +1723,10 @@ static void change(const Row *row, int dir)
         set_display("language", i < 0 ? "auto" : LANGUAGE_CODES[i]);
         break;
     }
+    case R_ADVANCED:
+        show_advanced = !show_advanced;
+        set_display("show_advanced", show_advanced ? "1" : "0"); /* (remembered) */
+        break;
     case R_CURSOR:
         display_set_hide_cursor(!ds.hide_cursor);
         set_display("hide_cursor", ds.hide_cursor ? "0" : "1");
@@ -1625,6 +1843,7 @@ static void change(const Row *row, int dir)
         int next = cycle(ds.renderer == RENDERER_VULKAN, 2, dir) ? RENDERER_VULKAN : RENDERER_DEFAULT;
 #endif
         set_display("renderer", renderer_name(next));
+        set_display("renderer_menu", renderer_name(next)); /* (#429: kept over an older launcher's renderer = d3d11: gpu_display.c) */
         display_set_renderer(next); /* (shown now; the renderer is chosen at the next start) */
         break;
     }
@@ -1715,6 +1934,12 @@ static void change(const Row *row, int dir)
         net.mode = cycle(net.mode, NET_MODE_COUNT, dir);
         net_save_server();
         break;
+    case R_NET_REGION: /* Auto, then each region */
+    {
+        int v = net_region_setting(NULL) + 1; /* (0 auto, 1.. the regions) */
+        net_region_save(cycle(v, NET_REGION_COUNT + 1, dir) - 1);
+        break;
+    }
     case R_NET_DIRECT:
         net.direct = !net.direct;
         settings_line_write(config_path(CONFIG_ONLINE_DIRECT), net.direct ? "on" : "off");
@@ -1976,8 +2201,16 @@ static void action(const Row *row)
         top[P_ASSIGN] = 0;
         break;
     case R_KEYS_BACK:
-    case R_CUSTOM_BACK:
+    case R_CTRLS_BACK:
         page = P_PADS;
+        break;
+    case R_CUSTOM_BACK:
+        page = P_CTRLS;
+        break;
+    case R_CTRLS:
+        page = P_CTRLS;
+        sel[P_CTRLS] = 1; /* the first controller */
+        top[P_CTRLS] = 0;
         break;
     case R_KEYS:
         page = P_KEYS;
@@ -2232,9 +2465,10 @@ static void edit_event(int ev, unsigned ch)
 }
 
 static int view_fit; /* how many rows the page shows at once (set when it is drawn) */
+static void move_sel(int dir);
 
-/* The mouse wheel on a page with a scroll bar scrolls the list, three rows a notch, and the cursor only moves when
- * its row leaves the view (to the nearest row that can be chosen); a page that fits has no bar: the wheel moves the cursor. */
+/* The mouse wheel on a page with a scroll bar scrolls the list, three rows a notch, and
+ * the cursor stays on its row, even out of view; a page that fits has no bar: the wheel does nothing. */
 static void wheel_scroll(int dir)
 {
     int *t = &top[page];
@@ -2243,25 +2477,9 @@ static void wheel_scroll(int dir)
         nt = nrows - view_fit;
     if (nt < 0)
         nt = 0;
-    if (nt == *t)
-        return;
-    int c = sel[page];
-    if (c < nt)
-    {
-        c = nt;
-        while (c < nt + view_fit && c < nrows && !selectable(&rows[c]))
-            c++;
-    }
-    else if (c >= nt + view_fit)
-    {
-        c = nt + view_fit - 1;
-        while (c >= nt && !selectable(&rows[c]))
-            c--;
-    }
-    if (c < nt || c >= nt + view_fit || c >= nrows)
-        return; /* nothing in view can be chosen: stay */
-    *t = nt;
-    sel[page] = c;
+    *t = nt; /* the view only; the cursor stays on its row (even when that row is out of view) */
+    wheel_free_sel = sel[page];
+    wheel_free_page = page;
 }
 
 static void move_sel(int dir)
@@ -2516,8 +2734,7 @@ static void mouse_press(int v)
         {
             if (view_fit > 0 && nrows > view_fit && !at_foot())
                 wheel_scroll(v == MENU_WHEEL_UP ? -1 : 1);
-            else
-                move_sel(v == MENU_WHEEL_UP ? -1 : 1);
+            /* (a page that fits has no bar to move: the wheel does nothing) */
         }
         return;
     }
@@ -3010,7 +3227,7 @@ void menu_draw(float w, float h)
     draw_w = w;
     draw_h = h;
     const unsigned WHITE = OVL_RGBA(240, 240, 245, 255), GREY = OVL_RGBA(150, 155, 170, 255), DIM = OVL_RGBA(110, 115, 130, 255),
-                   GREEN = OVL_RGBA(120, 220, 140, 255), AMBER = OVL_RGBA(245, 190, 90, 255), ACCENT = OVL_RGBA(225, 60, 60, 255);
+                   AMBER = OVL_RGBA(245, 190, 90, 255), ACCENT = OVL_RGBA(225, 60, 60, 255);
     ovl_rect(0, 0, w, h, OVL_RGBA(0, 0, 0, 150));
     float px = w * 0.06f, py = h * 0.06f, pw = w * 0.88f, ph = h * 0.88f;
     box(px, py, pw, ph, s);
@@ -3028,10 +3245,21 @@ void menu_draw(float w, float h)
     else if (restart_pending)
         snprintf(banner, sizeof banner, ui_text("Some changes take effect when the game starts again: Game > Restart the game."));
     char t[480];
-    if (toast_now(t, sizeof t))
+    int have_toast = toast_now(t, sizeof t);
+    if (have_toast)
         ovl_text(px + 300 * s, py + 34 * s, 24 * s, WHITE, t); /* (a message, in the menu: here) */
     else if (banner[0])
         ovl_text(px + 300 * s, py + 34 * s, 24 * s, strstr(status, "Room:") ? ACCENT : AMBER, banner);
+    { /* a legend in the top right corner: what the amber square on a row means (left out when a message would run into it) */
+        const char *key = ui_text("Takes effect on next start");
+        float ls = 22 * s, lw = text_w(key, ls), sq = 14 * s, lx0 = px + pw - 32 * s - lw - sq - 10 * s;
+        const char *msg = have_toast ? t : banner;
+        if (!msg[0] || px + 300 * s + text_w(msg, 24 * s) + 24 * s < lx0)
+        {
+            ovl_rect(lx0, py + 40 * s, sq, sq, AMBER);
+            ovl_text(lx0 + sq + 10 * s, py + 36 * s, ls, GREY, key);
+        }
+    }
     /* the pages: tabs across the top, between the L and R buttons that switch them */
     float tab_y = py + 92 * s, tab_h = 56 * s, icon = 56 * s;
     float lx = px + 32 * s, rx_icon = px + pw - 32 * s - icon;
@@ -3062,50 +3290,74 @@ void menu_draw(float w, float h)
     float fb_w = 220 * s, fb_h = 46 * s, fb_y = py + ph - 62 * s, quit_x = px + pw - 32 * s - fb_w, restart_x = quit_x - 16 * s - fb_w;
     foot_button(restart_x, fb_y, fb_w, fb_h, s, HIT_RESTART, at_foot() && foot == 1, "Restart game");
     foot_button(quit_x, fb_y, fb_w, fb_h, s, HIT_QUIT, at_foot() && foot == 2, "Quit game");
-    int fit = (int)((help_y - 16 * s - ry) / rh);
+    float avail = help_y - 16 * s - ry;
+    /* (how many rows fit from row a: a section's name is slimmer than a row) */
+#define FIT_FROM(a, out)                                                      do                                                                        {                                                                             float used_ = 0;                                                          (out) = 0;                                                                for (int q_ = (a); q_ < nrows; q_++)                                      {                                                                             used_ += rows[q_].id == R_HEADER ? (q_ == 0 ? rh * 1.1f : rh * 1.7f) : rh;                       if (used_ > avail + 0.01f)                                                    break;                                                                (out)++;                                                              }                                                                     } while (0)
+    int fit;
+    int *t0 = &top[page];
+    if (*t0 < 0 || *t0 >= (nrows ? nrows : 1))
+        *t0 = 0;
+    FIT_FROM(*t0, fit);
+    if (fit < 1)
+        fit = 1;
+    if (wheel_free_page == page && wheel_free_sel != sel[page])
+        wheel_free_page = -1; /* (the cursor moved: the view follows it again) */
+    int free_view = wheel_free_page == page && wheel_free_sel == sel[page]; /* the wheel scrolled; the cursor has not moved since */
+    if (!free_view && sel[page] < *t0)
+        *t0 = sel[page];
+    while (!free_view && sel[page] >= *t0 + fit && *t0 < nrows - 1)
+    {
+        (*t0)++;
+        FIT_FROM(*t0, fit);
+        if (fit < 1)
+            fit = 1;
+    }
+    while (*t0 > 0)
+    { /* not further down than the last row at the bottom of the view */
+        int f2;
+        FIT_FROM(*t0 - 1, f2);
+        if (*t0 - 1 + f2 < nrows)
+            break;
+        (*t0)--;
+    }
+    FIT_FROM(*t0, fit);
     if (fit < 1)
         fit = 1;
     view_fit = fit;
-    int *t0 = &top[page];
-    if (sel[page] < *t0)
-        *t0 = sel[page];
-    if (sel[page] >= *t0 + fit)
-        *t0 = sel[page] - fit + 1;
-    if (*t0 > nrows - fit)
-        *t0 = nrows - fit > 0 ? nrows - fit : 0;
     { /* the cursor cannot go onto a row that cannot be chosen: when only such rows are above the view, show the top of the page */
         int above = 0;
         for (int k = 0; k < *t0; k++)
             above |= rows[k].kind != K_INFO;
-        if (!above && sel[page] < fit)
+        if (!free_view && !above && sel[page] < fit)
             *t0 = 0;
     }
-    float vx = rx + rw * 0.40f;
+    float vx = rx + rw * 0.40f, ycur = ry;
     for (int i = *t0; i < nrows && i < *t0 + fit; i++)
     {
         const Row *r = &rows[i];
-        float y = ry + (float)(i - *t0) * rh;
+        float y = ycur;
+        ycur += r->id == R_HEADER ? (i == 0 ? rh * 1.1f : rh * 1.7f) : rh; /* (a section's name: space above it, but not at the top of the page) */
         int on = i == sel[page] && !at_foot();
         int pick = r->kind != K_INFO; /* a row that cannot be chosen is dimmed, with a line where the two kinds meet */
         float lx = rx + 16 * s;
-        if (i & 1) /* every other row a little paler: the eye follows a row from the label to its value */
-            ovl_rect(rx, y - 6 * s, rw, rh - 4 * s, OVL_RGBA(27, 31, 45, 255));
-        if (i > *t0 && pick != (rows[i - 1].kind != K_INFO))
-        { /* a line across the row, where the rows that can be chosen meet those that cannot */
-            ovl_rect(rx, y - (pick ? 14 : 8) * s, rw, 2 * s, OVL_RGBA(95, 103, 138, 255)); /* above a choosable row: up, clear of its outline; above one that cannot be chosen: down, in the gap */
+        if (r->id == R_SPACER)
+        { /* an empty row, a line across its middle: the rows that can be chosen meet those that cannot */
+            ovl_rect(rx, y - 6 * s + (rh - 4 * s) / 2 - s, rw, 2 * s, OVL_RGBA(95, 103, 138, 255));
+            continue;
         }
+        if (r->id == R_HEADER)
+        { /* a section's name: larger, with space above it (not at the top of the page) */
+            ovl_text(lx, y + (i == 0 ? 0 : 25 * s), 34 * s, OVL_RGBA(215, 220, 235, 255), r->label);
+            continue;
+        }
+        if (!on) /* a hairline under the row, in place of stripes: the eye follows a row from the label to its value */
+            ovl_rect(rx + 8 * s, floorf(y - 6 * s + rh - 3 * s), rw - 16 * s, s < 1 ? 1 : floorf(s), OVL_RGBA(40, 46, 66, 255));
         if (on)
         { /* the row under the cursor: a rectangle round it, the row itself left as it is */
             /* whole pixels: a line on a fraction of a pixel is 2 pixels thick here and 3 there */
             float bx = floorf(rx + 0.5f), by = floorf(y - 6 * s + 0.5f), bw = floorf(rx + rw + 0.5f) - bx, bh = floorf(y - 6 * s + rh - 4 * s + 0.5f) - by;
-            float t = floorf(2 * s + 0.5f);
-            if (t < 1)
-                t = 1;
-            u32 c = OVL_RGBA(200, 55, 55, 255); /* the menu's red, a little dimmer than the tab's underline */
-            ovl_rect(bx, by, bw, t, c);
-            ovl_rect(bx, by + bh - t, bw, t, c);
-            ovl_rect(bx, by, t, bh, c);
-            ovl_rect(bx + bw - t, by, t, bh, c);
+            ovl_rect(bx, by, bw, bh, OVL_RGBA(225, 60, 60, 150)); /* the whole row filled with the menu's red (the bars' colour), translucent */
+            ovl_rect(bx, by, floorf(6 * s + 0.5f), bh, ACCENT);   /* and a solid bar at its left edge */
         }
         ovl_text(lx, y, size, !pick ? DIM : WHITE, r->label);
         char v[480];
@@ -3113,10 +3365,10 @@ void menu_draw(float w, float h)
             snprintf(v, sizeof v, "< %s >", (r->kind == K_TEXT || r->id == R_NET_NAME || r->id == R_NET_STATUS || r->id == R_MOD_CODE ? r->value : ui_text(r->value)));
         else
             snprintf(v, sizeof v, "%s", (r->kind == K_TEXT || r->id == R_NET_NAME || r->id == R_NET_STATUS || r->id == R_MOD_CODE ? r->value : ui_text(r->value)));
-        const char *tag = r->note[0] ? r->note : r->when == W_NOW   ? ui_text("now")
-                                             : r->when == W_RESTART ? ui_text("next start")
-                                                                    : "";
-        float tag_size = 22 * s, tag_w = text_w(tag, tag_size);
+        /* the right edge: a note in words; otherwise nothing for "now" (most rows) and a small amber square for "next start"
+         * (the help line says so in words) */
+        const char *tag = r->note[0] ? r->note : "";
+        float tag_size = 22 * s, tag_w = tag[0] ? text_w(tag, tag_size) : r->when == W_RESTART ? 14 * s : 0;
         int room = (int)((rx + rw - 24 * s - tag_w - vx) / (size / 2)) - 1;
         if (room > 0 && ui_text_columns(v) > room)
         {
@@ -3131,9 +3383,10 @@ void menu_draw(float w, float h)
                                              : on                  ? WHITE
                                                                    : OVL_RGBA(200, 205, 220, 255),
                  v);
-        ovl_text(rx + rw - 16 * s - tag_w, y + 5 * s, tag_size, r->note[0] ? DIM : r->when == W_NOW ? GREEN
-                                                                                                    : AMBER,
-                 tag);
+        if (tag[0])
+            ovl_text(rx + rw - 16 * s - tag_w, y + 5 * s, tag_size, on ? OVL_RGBA(255, 225, 225, 255) : DIM, tag);
+        else if (r->when == W_RESTART)
+            ovl_rect(rx + rw - 16 * s - tag_w, y + 8 * s, 14 * s, 14 * s, on ? OVL_RGBA(255, 225, 225, 255) : AMBER);
     }
     if (nrows > fit)
     { /* a scroll bar at the right, outside the rows: the track the height of the visible rows, the thumb how much of the page shows and where */
@@ -3147,12 +3400,17 @@ void menu_draw(float w, float h)
     }
     /* the selected row's help, and the keys */
     ovl_rect(px + 20 * s, help_y - 8 * s, pw - 40 * s, 2 * s, OVL_RGBA(60, 66, 90, 255));
-    const char *help = at_foot() ? (foot == 1 ? "Starts the game again (for the settings marked 'next start'). A match in progress is lost."
+    const char *help = at_foot() ? (foot == 1 ? "Starts the game again (for the settings with an amber square). A match in progress is lost."
                                                : "Closes the game. A match in progress is lost.")
                        : sel[page] < nrows ? rows[sel[page]].help : NULL;
     if (help)
     {
-        char wrapped[1800];
+        char wrapped[1800], full[1700];
+        if (!at_foot() && sel[page] < nrows && rows[sel[page]].when == W_RESTART && !rows[sel[page]].note[0])
+        { /* (the amber square at the row's right edge, in words) */
+            snprintf(full, sizeof full, "%s %s", help, ui_text("Takes effect when the game starts again."));
+            help = full;
+        }
         wrap(help, (int)((pw - 80 * s) / (13 * s)), wrapped, sizeof wrapped);
         ovl_text(px + 36 * s, help_y + 4 * s, 26 * s, OVL_RGBA(200, 210, 230, 255), wrapped);
     }
@@ -3161,7 +3419,7 @@ void menu_draw(float w, float h)
              : page == P_KEYS   ? "Up/Down: choose   A/Enter: press a new key   Y/Delete: default   B/Backspace: back   Esc: close"
              : page == P_INPUTS ? "The numbers update live   B/Backspace: back   Esc: close"
              : page == P_ASSIGN ? "A on a controller: its player (not on Back)   B/Backspace or A on Back: done   Esc: close"
-             : page == P_STICKS || page == P_RUMBLE || page == P_CUSTOM ? "Up/Down: choose   Left/Right: change   A/Enter: select   B/Backspace: back   Esc: close"
+             : page == P_STICKS || page == P_RUMBLE || page == P_CUSTOM || page == P_CTRLS ? "Up/Down: choose   Left/Right: change   A/Enter: select   B/Backspace: back   Esc: close"
                                 : "Up/Down: choose   Left/Right: change   A/Enter: select   L/R, Q/E or Tab: page   B/Esc: close"));
     /* on top: a question, the text being typed, or a control being waited for */
     if (confirm)

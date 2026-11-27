@@ -22,8 +22,8 @@ namespace OpenSmash.Launcher
     // InstallerForm: the first-run window, shown instead of the launcher while no
     // build exists. Same chrome as LauncherForm (Theme): it finds the user's game
     // files, keys and firmware (DetectFolders, tools\gamefiles.py --json) and runs
-    // the repository's own installer, tools\install_windowsmash.ps1 -NoWizard (the
-    // same flow as Install WindowSmash.bat), which sets up Python, the compiler
+    // the repository's own installer, tools\install_opensmash.ps1 -NoWizard (the
+    // same flow as the setup window it replaces), which sets up Python, the compiler
     // and SDL3 and builds the game with tools\build_game.py.
     // The ssbu-recomp scans (scripts\find_inputs.py, scripts\precheck.py) run
     // only when those scripts are present at the root; this repo does not have them.
@@ -100,11 +100,11 @@ namespace OpenSmash.Launcher
         string _errMsg = "", _errHint = "", _errAction = "", _doneMsg = "";
         bool? _doneOk;
 
-        // tools\install_windowsmash.ps1's ten steps, so the steps not reached yet have their names and
+        // tools\install_opensmash.ps1's ten steps, so the steps not reached yet have their names and
         // estimates from the start: a step's estimate counts in the time left until it says its own.
         static readonly string[] InstallerSteps =
         {
-            "Get the newest WindowSmash", "Check this PC", "Python", "The compiler", "SDL3",
+            "Get the newest OpenSmash", "Check this PC", "Python", "The compiler", "SDL3",
             "Music and movie codecs", "Your game files", "Shortcut and firewall", "Build the game", "Shaders"
         };
 
@@ -735,7 +735,7 @@ namespace OpenSmash.Launcher
             string t = title.ToLowerInvariant();
             // (a first build is 30 minutes to a few hours; after that, what changed: minutes, mostly the link.
             // one guess each: the build's own bar replaces it as soon as it has a time left)
-            if (t.Contains("build the game")) return WindowSmash.IsBuilt(_repo) ? 300 : 5400;
+            if (t.Contains("build the game")) return GameFolder.IsBuilt(_repo) ? 300 : 5400;
             // (65,000 shaders took 1.5 hours on a fast PC at low priority; none when not wanted)
             if (t.Contains("shader")) return _optShaders ? 3600 : 5;
             if (t.Contains("compiler") || t.Contains("python package")) return 180;
@@ -939,10 +939,10 @@ namespace OpenSmash.Launcher
                 Alert("FIX THESE FOLDERS", UiLocale.Text("Please fix: ") + string.Join(", ", bad) + UiLocale.Text(".\n\nThe line under each folder says what is wrong. Press Check files after you change one."));
                 return;
             }
-            string ps1 = Path.Combine(_repo, "tools", "install_windowsmash.ps1");
+            string ps1 = GameFolder.Installer(_repo);
             if (!File.Exists(ps1))
             {
-                Alert("INSTALLER NOT FOUND", "tools\\install_windowsmash.ps1 is not in this folder. This copy of OpenSmash is incomplete.");
+                Alert("INSTALLER NOT FOUND", "tools\\install_opensmash.ps1 is not in this folder. This copy of OpenSmash is incomplete.");
                 return;
             }
             if (string.IsNullOrWhiteSpace(_onlineName))
@@ -953,7 +953,7 @@ namespace OpenSmash.Launcher
             string root = PsQuote(_repo);
             var cmd = new StringBuilder();
             cmd.Append("Get-ChildItem -LiteralPath '").Append(root).Append("' -Recurse -File -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue; ");
-            cmd.Append("& '").Append(root).Append("\\tools\\install_windowsmash.ps1'");
+            cmd.Append("& '").Append(PsQuote(ps1)).Append("'");
             cmd.Append(" -NoWizard -Game '").Append(PsQuote(_gamePath)).Append("' -Keys '").Append(PsQuote(_keysPath)).Append("'");
             if (string.IsNullOrWhiteSpace(_fwPath)) cmd.Append(" -NoFirmware");
             else cmd.Append(" -Firmware '").Append(PsQuote(_fwPath)).Append("'");
@@ -979,7 +979,7 @@ namespace OpenSmash.Launcher
             StartInstall(_optDry);
         }
 
-        // Python comes with the root installer (tools\install_windowsmash.ps1 step 3 puts
+        // Python comes with the root installer (tools\install_opensmash.ps1 step 3 puts
         // one into deps\python when the PC has none), so "set up Python" runs it.
         void StartBootstrap()
         {
@@ -1057,7 +1057,7 @@ namespace OpenSmash.Launcher
 
             if (_jobKind == "install" && !_jobDry)
             {
-                if (ok) Installed = WindowSmash.IsBuilt(_repo);
+                if (ok) Installed = GameFolder.IsBuilt(_repo);
             }
             if (_jobKind == "bootstrap" && ok)
             {
@@ -1327,7 +1327,7 @@ namespace OpenSmash.Launcher
             return x + w + 12 * s;
         }
 
-        // ---- the folders the WindowSmash setup window asked for, drawn in this screen's style
+        // ---- the folders the OpenSmash setup window asked for, drawn in this screen's style
         void DetectFolders()
         {
             var saved = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -1407,7 +1407,7 @@ namespace OpenSmash.Launcher
         {
             if (File.Exists(Path.Combine(folder, "romfs.bin")))
                 return (true, "romfs.bin found (the game data, used as it is).");
-            string? py = PythonExe();
+            var (py, pyArgs) = PythonExe();
             string script = Path.Combine(_repo, "tools", "gamefiles.py");
             if (py == null || !File.Exists(script))
                 return (true, "This folder will be read after Python is installed.");
@@ -1416,9 +1416,7 @@ namespace OpenSmash.Launcher
                 var psi = new ProcessStartInfo
                 {
                     FileName = py,
-                    Arguments = py.EndsWith("py.exe", StringComparison.OrdinalIgnoreCase) || Path.GetFileName(py).Equals("py", StringComparison.OrdinalIgnoreCase)
-                        ? "-3 \"" + script + "\" \"" + folder + "\" --keys \"" + keys + "\" --json"
-                        : "\"" + script + "\" \"" + folder + "\" --keys \"" + keys + "\" --json",
+                    Arguments = pyArgs + "\"" + script + "\" \"" + folder + "\" --keys \"" + keys + "\" --json",
                     WorkingDirectory = _repo,
                     UseShellExecute = false,
                     RedirectStandardOutput = true,
@@ -1458,24 +1456,57 @@ namespace OpenSmash.Launcher
             }
         }
 
-        string? PythonExe()
+        // The Python that reads the game folder, and the arguments before the script: the installer's own (deps/venv,
+        // deps/python), else a Python 3.10 or newer on the PATH or from the py launcher - the versions the installer
+        // accepts (tools/install_opensmash.ps1). (#424: an older python.exe on the PATH - a 2.7, a 3.6 - read the tools'
+        // newer syntax as "SyntaxError: invalid syntax" and the folder was reported unreadable.)
+        (string? Exe, string Args) PythonExe()
         {
-            string emb = Path.Combine(_repo, "deps", "python", "python.exe");
-            if (File.Exists(emb)) return emb;
+            foreach (string own in new[] { Path.Combine(_repo, "deps", "venv", "Scripts", "python.exe"), Path.Combine(_repo, "deps", "python", "python.exe") })
+                if (File.Exists(own) && PythonIsNewEnough(own, "")) return (own, "");
             string? path = Environment.GetEnvironmentVariable("PATH");
-            if (path == null) return null;
-            foreach (string dir in path.Split(Path.PathSeparator))
+            if (path != null)
+                foreach (string dir in path.Split(Path.PathSeparator))
+                {
+                    if (dir.Length == 0) continue;
+                    // (WindowsApps' python.exe is the Microsoft Store's shortcut: with no Python installed it only prints
+                    // "Python was not found...", the game folder was reported unreadable, and the install would not start.
+                    // The installer sets up its own Python; the folder is read after that.)
+                    if (dir.Contains(@"\WindowsApps", StringComparison.OrdinalIgnoreCase)) continue;
+                    string python;
+                    try { python = Path.Combine(dir.Trim('"'), "python.exe"); } catch { continue; }
+                    if (File.Exists(python) && PythonIsNewEnough(python, "")) return (python, "");
+                    string py = Path.Combine(dir.Trim('"'), "py.exe");
+                    if (File.Exists(py) && PythonIsNewEnough(py, "-3 ")) return (py, "-3 ");
+                }
+            // (#173) a Python installed without "Add python.exe to PATH" (only 3.10 or newer are picked)
+            string? installed = ModManagerProcess.FindInstalledPython();
+            if (installed != null && PythonIsNewEnough(installed, "")) return (installed, "");
+            return (null, "");
+        }
+
+        // Whether this Python runs and is 3.10 or newer.
+        static bool PythonIsNewEnough(string exe, string args)
+        {
+            try
             {
-                // (WindowsApps' python.exe is the Microsoft Store's shortcut: with no Python installed it only prints
-                // "Python was not found...", the game folder was reported unreadable, and the install would not start.
-                // The installer sets up its own Python; the folder is read after that.)
-                if (dir.Contains(@"\WindowsApps", StringComparison.OrdinalIgnoreCase)) continue;
-                string py = Path.Combine(dir, "py.exe");
-                if (File.Exists(py)) return py;
-                string python = Path.Combine(dir, "python.exe");
-                if (File.Exists(python)) return python;
+                var psi = new ProcessStartInfo
+                {
+                    FileName = exe,
+                    Arguments = args + "-c \"import sys; print(sys.version_info[0] * 100 + sys.version_info[1])\"",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true,
+                };
+                using var p = Process.Start(psi);
+                if (p == null) return false;
+                var outTask = p.StandardOutput.ReadToEndAsync();
+                _ = p.StandardError.ReadToEndAsync();
+                if (!p.WaitForExit(15000)) { try { p.Kill(); } catch { } return false; }
+                return outTask.Wait(2000) && int.TryParse(outTask.Result.Trim(), out int v) && v >= 310 && v < 400;
             }
-            return null;
+            catch { return false; }
         }
 
         void PickFolder(string which)
@@ -1517,7 +1548,7 @@ namespace OpenSmash.Launcher
             _ = CheckGameAsync();
         }
 
-        // ---- setup view: the WindowSmash questions, in this window's cards
+        // ---- setup view: the OpenSmash questions, in this window's cards
         void PaintSetup(Graphics g, int W, int H)
         {
             float s = _s, left = 96 * s, right = W - 96 * s;
@@ -1576,11 +1607,11 @@ namespace OpenSmash.Launcher
             using (var f = Theme.Body(11.5f * s))
                 Theme.DrawText(g, "fewer = PC stays usable", f, Theme.Dim, jx + 98 * s, oy, rightW - (jx - rx) - 110 * s, 28 * s);
             _tips["jobs:-"] = _tips["jobs:+"] = jobsTip;
-            PaintOption(g, "opt:updates", "Check for updates first", _optUpdates, rx, oy + 32 * s, rightW, 32 * s, "Looks for a newer WindowSmash on GitHub before building.");
+            PaintOption(g, "opt:updates", "Check for updates first", _optUpdates, rx, oy + 32 * s, rightW, 32 * s, "Looks for a newer OpenSmash on GitHub before building.");
             PaintOption(g, "opt:license", "Accept Microsoft's license terms for the C runtime and Windows SDK (the compiler download, about 570 MB)", _optLicense, rx, oy + 64 * s, rightW, 72 * s, "Read them first: https://go.microsoft.com/fwlink/?LinkId=2327714");
 
             float ay = 574 * s;
-            string label = _failedBefore || WindowSmash.IsBuilt(_repo) ? "RESUME"
+            string label = _failedBefore || GameFolder.IsBuilt(_repo) ? "RESUME"
                 : _succeeded && _jobKind == "install" && !_jobDry ? "BUILD AGAIN"
                 : "SET UP AND BUILD";
             float ax = ActionButton(g, "act:check", "CHECK FILES", left, ay, primary: false);

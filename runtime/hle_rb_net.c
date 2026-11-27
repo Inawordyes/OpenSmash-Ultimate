@@ -12,6 +12,7 @@ typedef struct Remote {
     RbnPad guess[RBN_RING]; uint32_t guess_at[RBN_RING];   /* the guess a frame ran on, until its real pad comes */
     uint32_t newest;                                   /* every frame up to this one received */
     uint32_t gone;                                     /* (v0.9.2) gone from the fight after this frame: none from then on, 0: here */
+    int gone_none;                                     /* gone before its first pad (cutoff 0; gone is then 1): none of its pads is real */
 } Remote;
 #define SAMPLES 32
 /* everything a session keeps, in one place (rbn_state: the test runs two sessions in one process) */
@@ -95,7 +96,7 @@ void rbn_remote(int p, uint32_t frame, RbnPad pad) {
     Remote *r = &remote[p];
     if (frame + RBN_RING <= r->newest + 1 || frame > r->newest + RBN_RING) return;   /* outside the ring */
     if (r->at[frame & MASK] == frame) return;   /* (sent again: it already came) */
-    if (r->gone && frame > r->gone) return;    /* (past its cutoff: none, on every game alike) */
+    if (r->gone && (frame > r->gone || r->gone_none)) return;    /* (past its cutoff: none, on every game alike) */
     pad = rbn_rest(pad);
     r->pad[frame & MASK] = pad; r->at[frame & MASK] = frame;
     while (r->at[(r->newest + 1) & MASK] == r->newest + 1) r->newest++;
@@ -121,7 +122,7 @@ RbnPad rbn_get(int p, uint32_t frame, int *guessed) {
     if (p < 0 || p >= nplayers || !frame) return none;
     if (p == local_player) { RbnPad out = none; rbn_local_get(frame, &out); return out; }
     Remote *r = &remote[p];
-    if (r->gone && frame > r->gone) return none;
+    if (r->gone && (frame > r->gone || r->gone_none)) return none;
     if (r->at[frame & MASK] == frame) return r->pad[frame & MASK];
     /* not here yet: the newest real pad before it, held (a re-run of the frame guesses again, maybe better) */
     RbnPad g = none;
@@ -136,21 +137,40 @@ uint32_t rbn_take_mismatch(void) { uint32_t m = mismatch; mismatch = 0; return m
 void rbn_put_mismatch(uint32_t m) { if (m && (!mismatch || m < mismatch)) mismatch = m; }
 
 /* (a gone player's pads are all known once its real ones up to the cutoff came: none after it) */
-static uint32_t known_up_to(int p) { return remote[p].gone && remote[p].newest >= remote[p].gone ? 0xFFFFFFF0u : remote[p].newest; }
+static uint32_t known_up_to(int p) {
+    return remote[p].gone && (remote[p].gone_none || remote[p].newest >= remote[p].gone) ? 0xFFFFFFF0u : remote[p].newest;
+}
+int rbn_gone_known(int p) { return p >= 0 && p < nplayers && p != local_player && known_up_to(p) == 0xFFFFFFF0u; }
 uint32_t rbn_confirmed(void) {
     uint32_t c = local_newest;
     for (int p = 0; p < nplayers; p++) if (p != local_player && known_up_to(p) < c) c = known_up_to(p);
     return c;
 }
+/* SSBU_RB_MAXBACK=<n> (1..16): how far past a peer's newest pad the game runs before it waits (default RBN_MAX_BACK) */
+int rbn_max_back(void) {
+    static int max_back = -1;
+    if (max_back < 0) { const char *e = getenv("SSBU_RB_MAXBACK"); int v = e && *e ? atoi(e) : 0; max_back = v >= 1 && v <= 16 ? v : RBN_MAX_BACK; }
+    return max_back;
+}
 int rbn_can_run(uint32_t frame) {
-    for (int p = 0; p < nplayers; p++) if (p != local_player && frame > known_up_to(p) + RBN_MAX_BACK) return 0;
+    const uint32_t mb = (uint32_t)rbn_max_back();
+    for (int p = 0; p < nplayers; p++) if (p != local_player && frame > known_up_to(p) + mb) return 0;
     return 1;
 }
 void rbn_gone(int p, uint32_t after, uint32_t ran) {
-    if (p < 0 || p >= nplayers || p == local_player || !after) return;
+    if (p < 0 || p >= nplayers || p == local_player) return;
     Remote *r = &remote[p];
-    if (r->gone && r->gone <= after) return;   /* (the earliest cutoff heard holds) */
-    r->gone = after;
+    /* (after 0: gone before its first pad - a game that never started the fight. That cutoff was taken as 1 before,
+     * and then frame 1's pad, which never comes, was waited for without end: 0.5.1's freeze report 683764e5, "player 1
+     * is gone from this fight (the host's game never started this fight) after logic frame 1", 1633 times) */
+    if (!after) {
+        if (r->gone_none) return;
+        r->gone_none = 1;
+        if (!r->gone) r->gone = 1;
+    } else {
+        if (r->gone && r->gone <= after) return;   /* (the earliest cutoff heard holds) */
+        r->gone = after;
+    }
     /* frames past the cutoff this game already ran (up to `ran`) on a guess, or on a real pad that came before it
      * left, other than none: run again */
     static const RbnPad none;
@@ -241,13 +261,18 @@ int rbn_online_delay_for_rtt(double rtt_ms) {
      * once, catch-ups 22 ms - pair runs 2026-11-10), and 1 under 15 ms (a home network). 2 at the least: at a 40 ms
      * round trip, delay 1 made 1263 rollbacks in a fight, about 50 frames a second and a desync; delay 2 made 15 in two
      * fights, 60 a second, in sync */
-    /* From 100 ms one way, the whole trip in frames, not less one, at most RBN_ONLINE_DELAY_MAX: a frame less made
+    /* (Before 2026-11-24, with costlier catch-ups:) from 100 ms one way, the whole trip in frames, not less one, at most RBN_ONLINE_DELAY_MAX: a frame less made
      * rollbacks of 4-6 frames there, and with the load each over the 16.7 ms frame - pair runs 2026-11-11, catch-ups over
      * a frame at 120 ms one way, delay 6 -> 7: 25 % / 18 % -> 4.6 % / 2.1 %; at 150, 8 -> 9: 27 % / 14 % -> 3.5 % / 4.3 %.
      * The frame more is 17 ms of input delay, where the trip is already 100 ms or more. */
+    /* 2026-11-24 (NET130 sweep, plan/INPUT_LAG_2026-11-24.md): catch-ups now cost ~3 ms to load + ~1.8 ms a frame (depth
+     * 4 ~10 ms), so the one-way trip in frames less TWO everywhere: at 141 ms one way delay 6 had 0-18 waits, 1-3 % of
+     * catch-ups over the frame, 17-32 refreshes over 25 ms a side in a fight, against delay 8's 0 and 0-11 - two frames
+     * (33 ms) of input delay back for that; delay 5 there: up to 18 % over the frame; 4 and less waited for pads hundreds
+     * of times. At 72 ms one way delay 2: no waits, under 1 % over the frame. */
     if (rtt_ms < 15) return 1;
     double one_way = rtt_ms / 2;
-    int d = (int)(one_way / (1000.0 / 60) + 0.5) - (one_way >= 100 ? 0 : 1);
+    int d = (int)(one_way / (1000.0 / 60) + 0.5) - 2;
     return d < 2 ? 2 : d > RBN_ONLINE_DELAY_MAX ? RBN_ONLINE_DELAY_MAX : d;
 }
 int rbn_hello_parse(const uint8_t *b, size_t len, RbnHello *h) {
@@ -312,12 +337,12 @@ int rbn_ready_parse(const uint8_t *b, size_t len, RbnReady *r) {
 
 size_t rbn_menu_build(uint8_t *b, size_t cap, const RbnMenu *m) {
     if (cap < RBN_MENU_BYTES || m->player < 0 || m->player >= RBN_PLAYERS) return 0;
-    b[0] = RBN_MSG_MENU; b[1] = (uint8_t)m->player; b[2] = (uint8_t)(m->buttons & 3); b[3] = 0;
+    b[0] = RBN_MSG_MENU; b[1] = (uint8_t)m->player; b[2] = (uint8_t)(m->buttons & 3); b[3] = (uint8_t)(m->done & 1);
     return RBN_MENU_BYTES;
 }
 int rbn_menu_parse(const uint8_t *b, size_t len, RbnMenu *m) {
     if (len != RBN_MENU_BYTES || b[0] != RBN_MSG_MENU || b[1] >= RBN_PLAYERS) return 0;
-    m->player = b[1]; m->buttons = b[2] & 3;
+    m->player = b[1]; m->buttons = b[2] & 3; m->done = b[3] & 1;
     return 1;
 }
 

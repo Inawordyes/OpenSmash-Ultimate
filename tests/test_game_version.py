@@ -1,4 +1,4 @@
-"""tools/game_version.py: WindowSmash builds and plays game version 13.0.5 only. What a game
+"""tools/game_version.py: OpenSmash builds and plays game version 13.0.5 only. What a game
 folder's files say about the version (scan_problem: the installers' window), a main module's
 build id, and the places that keep their own copy of 13.0.5's build id. No game files."""
 from pathlib import Path
@@ -9,6 +9,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
+sys.path.insert(0, str(ROOT / 'tests'))
 import game_version as gv  # noqa: E402
 import modcache  # noqa: E402
 
@@ -27,7 +28,7 @@ class ScanTests(unittest.TestCase):
 
     def test_another_update(self):
         text = gv.scan_problem(program('update', version=30 << 16, display_version='13.0.4'))
-        self.assertEqual(text, "WindowSmash needs version 13.0.5, and this is the game's update 13.0.4: put the 13.0.5 "
+        self.assertEqual(text, "OpenSmash needs version 13.0.5, and this is the game's update 13.0.4: put the 13.0.5 "
                                "update (.nsp) in this folder instead.")
         self.assertLessEqual(len(text), 130)   # (the installer's window has two lines for it, with "Problem: ")
         self.assertIn("update v12:", gv.scan_problem(program('update', version=12 << 16)))
@@ -36,7 +37,7 @@ class ScanTests(unittest.TestCase):
 
     def test_a_game_without_the_update(self):
         text = gv.scan_problem(program('base', version=0, data_version='11.0.0', display_version='1.0.0'))
-        self.assertEqual(text, 'WindowSmash needs version 13.0.5, and this is the game at 11.0.0 without its 13.0.5 '
+        self.assertEqual(text, 'OpenSmash needs version 13.0.5, and this is the game at 11.0.0 without its 13.0.5 '
                                'update: put that update (.nsp) in this folder.')   # (data.arc's version first)
         self.assertLessEqual(len(text), 130)
         self.assertIn('the game at 1.0.0 without', gv.scan_problem(program('base', data_version='', display_version='1.0.0')))
@@ -54,7 +55,7 @@ class ScanTests(unittest.TestCase):
 
     def test_message_names_the_folder(self):
         self.assertEqual(gv.needs('the program in p.nca is version 11.0.0', 'D:\\MyDump'),
-                         "WindowSmash needs version 13.0.5 of the game, and the program in p.nca is version 11.0.0. "
+                         "OpenSmash needs version 13.0.5 of the game, and the program in p.nca is version 11.0.0. "
                          "Put the game's 13.0.5 update (an .nsp file) in D:\\MyDump, next to the game.")
 
 
@@ -92,9 +93,12 @@ class BuildIdTests(unittest.TestCase):
             'tools/Unlock-All-Fighters.ps1': r"\$knownLayouts = @\{\s*'([0-9A-F]+)'",
             'tools/mac/boottest/main/g_module.c': r'relocs, 4, "([0-9A-F]+)"',
         }
-        relay = (ROOT / 'tools' / 'ssbu_relay.py').read_text(encoding='utf-8')
-        if want in relay or 'REQUIRED_BUILD' in relay:   # (the lobby's own check, where it has one)
-            copies['tools/ssbu_relay.py'] = r'REQUIRED_BUILD = b?"([0-9A-F]+)"'
+        import netproto   # (the lobby's own check, where it has one: the lobby server is in a repository of its own)
+        relay_file = netproto.SERVER_DIR / 'tools' / 'ssbu_relay.py'
+        relay = relay_file.read_text(encoding='utf-8') if netproto.HAVE_LOBBY else ''
+        if want in relay or 'REQUIRED_BUILD' in relay:
+            copies[str(relay_file)] = r'REQUIRED_BUILD = b?"([0-9A-F]+)"'
+        copies['tests/netproto.py'] = r'(?m)^BUILD = "([0-9A-F]+)"'
         for name, pattern in copies.items():
             with self.subTest(name):
                 found = re.findall(pattern, (ROOT / name).read_text(encoding='utf-8'))

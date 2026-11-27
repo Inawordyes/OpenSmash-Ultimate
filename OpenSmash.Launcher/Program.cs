@@ -22,10 +22,26 @@ namespace OpenSmash.Launcher
 
             // The Play SSBU shortcut: the game straight away once it is built (the launcher waits, hidden, for it).
             if (args.Contains("--play", StringComparer.OrdinalIgnoreCase) && ProjectSetup.FindProject(AppContext.BaseDirectory) is string built
-                && WindowSmash.IsBuilt(built))
+                && GameFolder.IsBuilt(built))
             {
-                using var game = WindowSmash.StartGame(built);
+                // (no lobby line yet: the official lobby, the launchers' default - OpenSmash.Core.OnlineSettings)
+                OpenSmash.Core.OnlineSettings.EnsureLine(GameFolder.ConfigFile(built, "online_server.txt"));
+                // (v0.5.0) the signed-in account's lobby ticket, kept fresh while the game runs
+                string? pass = null;
+                OpenSmash.Core.OnlinePass? keeper = null;
+                try
+                {
+                    var account = new OpenSmash.Core.Account(built);
+                    if (account.Service.Configured && account.ResumeAsync().GetAwaiter().GetResult())
+                    {
+                        keeper = new OpenSmash.Core.OnlinePass(account, built);
+                        if (keeper.WriteAsync().GetAwaiter().GetResult()) { pass = keeper.File; keeper.KeepFresh(); }
+                    }
+                }
+                catch { }
+                using var game = GameFolder.StartGame(built, pass);
                 game?.WaitForExit();
+                keeper?.Dispose();
                 return;
             }
 
@@ -38,7 +54,12 @@ namespace OpenSmash.Launcher
 
             // Ensure single instance
             using var mutex = new Mutex(true, "Global\\OpenSmashLauncher", out bool createdNew);
+            if (!createdNew && args.Contains("--updated", StringComparer.OrdinalIgnoreCase))
+            {   // (v0.5.0: the launcher that replaced itself is still closing: its successor waits for it)
+                try { createdNew = mutex.WaitOne(TimeSpan.FromSeconds(20)); } catch (AbandonedMutexException) { createdNew = true; }
+            }
             if (!createdNew) return;
+            OpenSmash.Core.Updater.CleanUp();   // (the .old exe a self-update left)
 
             // Resolve repo root (where the .exe lives, or the repo above its build output folder)
             string repo = ProjectSetup.ExeRoot(AppContext.BaseDirectory);
@@ -80,15 +101,16 @@ namespace OpenSmash.Launcher
 
             UiLocale.Initialize(repo);
 
-            // No build yet (or --installer): Install WindowSmash comes first.
-            if (!WindowSmash.IsBuilt(repo) || args.Contains("--installer", StringComparer.OrdinalIgnoreCase))
+            // No build yet (or --installer): Install OpenSmash comes first.
+            if (!GameFolder.IsBuilt(repo) || args.Contains("--installer", StringComparer.OrdinalIgnoreCase))
             {
+                LauncherForm.NameReleaseForInstaller(repo);   // (v0.5.0: a release's install takes its prebuilt runtime)
                 using var installer = new InstallerForm(workDir, repo);
                 UiLocale.Attach(installer);
                 Application.Run(installer);
-                if (!installer.Installed || !WindowSmash.IsBuilt(repo)) return;
+                if (!installer.Installed || !GameFolder.IsBuilt(repo)) return;
             }
-            using var launcher = new LauncherForm(workDir, repo, WindowSmash.BuildDir(repo));
+            using var launcher = new LauncherForm(workDir, repo, GameFolder.BuildDir(repo));
             UiLocale.Attach(launcher);
             Application.Run(launcher);
         }
@@ -125,14 +147,22 @@ namespace OpenSmash.Launcher
 
     }
 
-    // What Install WindowSmash.bat and Play SSBU.bat do, so the window and those files start the same game.
-    static class WindowSmash
+    // What the setup and Play SSBU.bat do, so the window and those files start the same game.
+    static class GameFolder
     {
         static readonly string[] ClearedVars =
         {
             "SSBU_NET_BACKEND", "SSBU_YUZU_PASSWORD", "SSBU_YUZU_TOKEN", "SSBU_DATA_ROOT", "SSBU_INPUT", "SSBU_RENDERER", "SSBU_DISPLAY", "SSBU_NET_HOST", "SSBU_NET_RELAY", "SSBU_NET_BIND",
             "SSBU_NET_ROOM", "SSBU_NET_NAME", "SSBU_NET_DIRECT", "SSBU_NET_PORT"
         };
+
+        // The setup: tools\install_opensmash.ps1, else tools\install_windowsmash.ps1 in a copy from before the rename
+        // (the same installer; this launcher can be newer than the folder it updates).
+        public static string Installer(string repo)
+        {
+            string now = Path.Combine(repo, "tools", "install_opensmash.ps1"), old = Path.Combine(repo, "tools", "install_windowsmash.ps1");
+            return File.Exists(now) || !File.Exists(old) ? now : old;
+        }
 
         public static string BuildDir(string repo) => Path.GetFullPath(Path.Combine(repo, "build"));
         public static bool IsBuilt(string repo) => File.Exists(Path.Combine(BuildDir(repo), "ssbu.exe"));
@@ -163,7 +193,7 @@ namespace OpenSmash.Launcher
         [DllImport("user32.dll")]
         static extern bool AllowSetForegroundWindow(int dwProcessId);
 
-        public static Process? StartGame(string repo)
+        public static Process? StartGame(string repo, string? onlinePassFile = null)
         {
             string exe = Path.Combine(BuildDir(repo), "ssbu.exe");
             if (!File.Exists(exe)) return null;
@@ -183,10 +213,21 @@ namespace OpenSmash.Launcher
                 RedirectStandardError = true,
             };
             foreach (string v in ClearedVars) psi.EnvironmentVariables.Remove(v);
+            psi.EnvironmentVariables[OpenSmash.Core.VersionInfo.EnvName] = OpenSmash.Core.VersionInfo.Launcher;   // (the game's Esc menu shows it)
+            if (onlinePassFile != null) psi.EnvironmentVariables["SSBU_ONLINE_TICKET_FILE"] = onlinePassFile;   // (v0.5.0: the account's lobby ticket)
+            var proc = StartLogged(psi, log);
+            if (proc != null) try { AllowSetForegroundWindow(proc.Id); } catch { }
+            return proc;
+        }
+
+        /// <summary>psi (its output redirected) started, every line it writes appended to log. A game started again from
+        /// its settings (runtime/hle_settings.c settings_restart) is a new process with the same output, so its lines go
+        /// on into the same log after proc has ended.</summary>
+        internal static Process? StartLogged(ProcessStartInfo psi, string log)
+        {
             var logLock = new object();
             var proc = Process.Start(psi);
             if (proc == null) return null;
-            try { AllowSetForegroundWindow(proc.Id); } catch { }
             void Write(string? line)
             {
                 if (line == null) return;
@@ -201,5 +242,11 @@ namespace OpenSmash.Launcher
             proc.BeginErrorReadLine();
             return proc;
         }
+
+        /// <summary>the end of a game StartLogged started: of proc and of every game started again after it. proc's Exited
+        /// (and HasExited) come with proc's own end, the first of them; WaitForExit() with no time limit waits for the end
+        /// of the redirected output too, which a game started again keeps open until it ends (and all its lines are in
+        /// the log by then).</summary>
+        public static Task Ended(Process proc) => Task.Run(() => { try { proc.WaitForExit(); } catch { } });
     }
 }

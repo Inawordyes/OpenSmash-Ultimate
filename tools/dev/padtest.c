@@ -12,6 +12,11 @@
 /* (what hle_pad.c reaches outside itself; the file is not read here, and nothing is converted) */
 const char *config_path(enum ConfigFile file) { (void)file; return "controllers.ini"; }
 int settings_ini_set(const char *path, const char *section, const char *key, const char *value) { (void)path; (void)section; (void)key; (void)value; return 0; }
+/* (hle_padble.c's, not built here: no Switch 2 controller over Bluetooth in a test) */
+int padble_start(int trace) { (void)trace; return 0; }
+void padble_poll(PadBleState out[PADBLE_PORTS]) { memset(out, 0, sizeof(PadBleState) * PADBLE_PORTS); }
+void padble_player(int port, int slot) { (void)port; (void)slot; }
+void padble_vibrate(int port, const float motors[2][4]) { (void)port; (void)motors; }
 
 static int failures, checks;
 #define CHECK(cond, ...) do { checks++; if (!(cond)) { failures++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -525,9 +530,11 @@ static void test_keyboard(void) {
     CHECK(keys(&lx, &ly, &rx, &ry, 4, 'A', 'S', 'Q', 'W') == (1ull << N_L | 1ull << N_R | 1ull << N_ZL | 1ull << N_ZR), "A S Q W are L R ZL ZR");
     CHECK(keys(&lx, &ly, &rx, &ry, 2, VK_RETURN, VK_BACK) == (1ull << N_PLUS | 1ull << N_MINUS), "Enter, Backspace");
     CHECK(keys(&lx, &ly, &rx, &ry, 2, VK_RETURN, VK_MENU) == 0, "Alt+Enter is not +");
-    CHECK(keys(&lx, &ly, &rx, &ry, 2, VK_LEFT, VK_UP) == 0 && lx == -32767 && ly == 32767 && !rx && !ry, "arrows: the left stick");
-    CHECK(keys(&lx, &ly, &rx, &ry, 2, 'L', 'K') == 0 && rx == 32767 && ry == -32767 && !lx && !ly, "L K: the right stick");
+    CHECK(keys(&lx, &ly, &rx, &ry, 2, VK_LEFT, VK_UP) == 0 && lx == -23170 && ly == 23170 && !rx && !ry, "arrows: the left stick, a diagonal on the circle (#527)");
+    CHECK(keys(&lx, &ly, &rx, &ry, 2, 'L', 'K') == 0 && rx == 23170 && ry == -23170 && !lx && !ly, "L K: the right stick");
     CHECK(keys(&lx, &ly, &rx, &ry, 2, VK_LEFT, VK_RIGHT) == 0 && lx == 32767, "left and right: right, as before");
+    CHECK(keys(&lx, &ly, &rx, &ry, 1, VK_DOWN) == 0 && ly == -32767 && !lx, "one direction: fully");
+    CHECK(keys(&lx, &ly, &rx, &ry, 2, VK_DOWN, VK_RIGHT) == 0 && lx == 23170 && ly == -23170, "down + forward: x under a dash, a crawl (#527)");
     CHECK(keys(&lx, &ly, &rx, &ry, 1, 'E') == 0, "E: nothing");
 
     load_text("[keyboard]\nA = Space, j\nB = x ; a comment\nLSTICK_LEFT = a\nLSTICK_RIGHT = D\nLSTICK_UP = w\nLSTICK_DOWN = s\nL = none\n"
@@ -535,7 +542,7 @@ static void test_keyboard(void) {
     CHECK(keys(&lx, &ly, &rx, &ry, 1, VK_SPACE) == 1ull << N_A && keys(&lx, &ly, &rx, &ry, 1, 'J') == 1ull << N_A, "A = Space, J");
     CHECK(keys(&lx, &ly, &rx, &ry, 1, 'Z') == 0, "Z no longer A");
     CHECK(keys(&lx, &ly, &rx, &ry, 1, 'X') == 1ull << N_B, "B = x (any case, comment after)");
-    CHECK(keys(&lx, &ly, &rx, &ry, 2, 'A', 'W') == 0 && lx == -32767 && ly == 32767, "WASD movement");
+    CHECK(keys(&lx, &ly, &rx, &ry, 2, 'A', 'W') == 0 && lx == -23170 && ly == 23170, "WASD movement");
     CHECK(keys(&lx, &ly, &rx, &ry, 1, VK_LEFT) == 0 && lx == 0, "the arrows no longer move");
     CHECK(keys(&lx, &ly, &rx, &ry, 1, 'J') == 1ull << N_A && rx == -32767, "a key on two bindings: both (J is A and still the right stick's left)");
     CHECK(keys(&lx, &ly, &rx, &ry, 2, 0x68, 0x62) == (1ull << N_UP | 1ull << N_DOWN), "the d-pad on Num8, 0x62");
@@ -717,11 +724,88 @@ static void test_device_sections(void) {
     CHECK((press(&two, 1u << RB_WEST, 0, 0) & 1ull << N_X) && two.rumble == 50, "the same model on another port: GUID's and type's");
 }
 
+/* A GameCube adapter in PC mode (GUID vendor 0x0079): the stick's travel taken as 100 counts (C-stick 87), then the console's 56 / 44. */
+static void test_gc_pcmode(void) {
+    load_text("");
+    cfg.gc_switch = 1; cfg.def.outer = -1;   /* (load_text starts from zeros; the file's defaults are 1 and -1) */
+    Dev pc = make_dev("03004271790000004418000000016800", "", "", "Nintendo GameCube Controller", "gamecube");
+    dev_configure(&pc, NULL);
+    CHECK(dev_gc_pcmode(&pc), "the Mayflash GUID is a PC mode adapter");
+    Raw raw = {0, {0, 0, 0, 0, 0, 0}};
+    PadState o;
+    dev_state(&pc, &raw, &o);
+    CHECK(o.lx == 0 && o.ly == 0 && o.rx == 0 && o.ry == 0, "rest: no dead zone needed");
+    raw.axis[RA_LEFTX] = 129;   /* (byte 128 at rest, in SDL's terms) */
+    dev_state(&pc, &raw, &o);
+    CHECK(o.lx == 0, "half a count is no count: %d", o.lx);
+    raw.axis[RA_LEFTX] = 32767; raw.axis[RA_LEFTY] = 0;
+    dev_state(&pc, &raw, &o);
+    CHECK(o.lx == 32767 && o.ly == 0, "full tilt right: %d %d", o.lx, o.ly);
+    raw.axis[RA_LEFTX] = 32767 * 56 / 100;   /* 56 counts of 100: the console's full scale */
+    dev_state(&pc, &raw, &o);
+    CHECK(o.lx >= 32700 && o.lx <= 32767, "56 of 100 counts is full: %d", o.lx);
+    raw.axis[RA_LEFTX] = 32767 * 28 / 100;   /* 28 counts: half way, on the console's grid */
+    dev_state(&pc, &raw, &o);
+    CHECK(o.lx == 28 * 32767L / 56, "28 counts: %d", o.lx);
+    raw.axis[RA_LEFTX] = 0; raw.axis[RA_RIGHTX] = 32767 * 44 / 87;
+    dev_state(&pc, &raw, &o);
+    CHECK(o.rx >= 32700 && o.rx <= 32767 && o.lx == 0, "the C-stick: 44 of 87 counts is full: %d", o.rx);
+    raw.axis[RA_RIGHTX] = 32767; raw.axis[RA_RIGHTY] = -32767;
+    dev_state(&pc, &raw, &o);
+    CHECK(o.rx * (long)o.rx + o.ry * (long)o.ry <= 32767L * 32767L + 40000, "inside the circle: %d %d", o.rx, o.ry);
+    raw.axis[RA_LEFTX] = -32768; raw.axis[RA_LEFTY] = 0; raw.axis[RA_RIGHTX] = 0; raw.axis[RA_RIGHTY] = 0;
+    dev_state(&pc, &raw, &o);
+    CHECK(o.lx == -32767 && o.ly == 0, "full tilt left (SDL's -32768): %d %d", o.lx, o.ly);
+    raw.axis[RA_LEFTX] = 0; raw.axis[RA_LEFTY] = 32767 * 28 / 100;   /* SDL's y grows downwards: the game's grows upwards */
+    dev_state(&pc, &raw, &o);
+    CHECK(o.ly == -(28 * 32767L / 56) && o.lx == 0, "left stick down: %d", o.ly);
+    raw.axis[RA_LEFTY] = 0; raw.axis[RA_RIGHTY] = -32767 * 22 / 87;
+    dev_state(&pc, &raw, &o);
+    CHECK(o.ry == (long)(22 * 32767L / 44) && o.rx == 0, "C-stick up, 22 counts of 44: %d", o.ry);
+    Dev other = make_dev("03004271790000000600000000016800", "", "", "Generic pad", "gamecube");   /* (0079:0006, not an adapter) */
+    CHECK(!dev_gc_pcmode(&other), "another 0079 pad is not taken for the adapter");
+    PadInfo info;
+    dev_info(&pc, &raw, &info);
+    CHECK(info.pc_mode && info.pc_scaled, "the menu knows: %d %d", info.pc_mode, info.pc_scaled);
+    pc.invert = 1;   /* (leftx) */
+    raw.axis[RA_LEFTX] = 32767 * 28 / 100; raw.axis[RA_RIGHTY] = 0;
+    dev_state(&pc, &raw, &o);
+    CHECK(o.lx == -(28 * 32767L / 56), "invert applies before the scaling: %d", o.lx);
+    pc.invert = 0;
+    load_text("[device default]\ndeadzone = 10\nouter_zone = 98\n");
+    cfg.gc_switch = 1;
+    dev_configure(&pc, NULL);
+    dev_state(&pc, &raw, &o);
+    CHECK(o.lx != 28 * 32767L / 56, "a zone set in [device default] is the player's choice: %d", o.lx);
+    dev_info(&pc, &raw, &info);
+    CHECK(info.pc_mode && !info.pc_scaled, "and the menu knows it is not scaled");
+    load_text("[device default]\nouter_zone = 90\n");
+    cfg.gc_switch = 1;
+    dev_configure(&pc, NULL);
+    dev_state(&pc, &raw, &o);
+    CHECK(o.lx != 28 * 32767L / 56, "an outer zone alone is a choice too: %d", o.lx);
+    load_text("[general]\ngc_switch = 0\n");
+    cfg.def.outer = -1;
+    dev_configure(&pc, NULL);
+    raw.axis[RA_LEFTX] = 32767 * 28 / 100; raw.axis[RA_RIGHTX] = raw.axis[RA_RIGHTY] = 0;
+    dev_state(&pc, &raw, &o);
+    CHECK(o.lx != 28 * 32767L / 56, "gc_switch = 0: the earlier scaling: %d", o.lx);
+    load_text("[device gamecube]\ndeadzone = 5\n");
+    cfg.gc_switch = 1; cfg.def.outer = -1;
+    dev_configure(&pc, NULL);
+    dev_state(&pc, &raw, &o);
+    CHECK(o.lx != 28 * 32767L / 56, "a dead zone the player set: the earlier way: %d", o.lx);
+    Dev nin = make_dev("030000007e0500003703000000016800", "", "", "Nintendo GameCube Controller", "gamecube");
+    CHECK(!dev_gc_pcmode(&nin), "Nintendo's own adapter is not a PC mode adapter");
+}
+
 int main(void) {
+    _putenv("SSBU_GC_SWITCH=");   /* (the file decides here, not an environment this was started in) */
     test_keyboard();
     test_config();
     test_mapping();
     test_gamecube();
+    test_gc_pcmode();
     padusb_set_switch(0);   /* the two below test the earlier (calibrating) scaling; test_axes_switch the console's */
     test_usb();
     test_pipes();

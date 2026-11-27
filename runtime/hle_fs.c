@@ -17,6 +17,7 @@
 #include <stdlib.h>
 
 #include "host.h"
+#include "language.h"     /* (the save's text language) */
 #include "mod_refresh.h"
 
 #ifndef _WIN32   /* (the save journal's few calls Windows has no stand-in for in runtime/linux) */
@@ -79,9 +80,167 @@ static int pread_all(HANDLE h, u64 offset, void *buf, u64 size) {
     return 1;
 }
 
+
+/* ---- a source that is the game's own encrypted file, read in place (romfs.crypt) -----------------------------
+ * The game as the Switch stores it has its RomFS section encrypted (AES-128-CTR); the installer used to decrypt
+ * it into a copy (14 GB) for the reads above. With SSBU_DATA_IN_PLACE=1 at install (tools/build_game.py,
+ * tools/nca.py --in-place) there is no copy: romfs.cfg names the game's own file and romfs.crypt, beside it,
+ * lists that file's encrypted bytes: "<file>\t<from>\t<to>\t<nca>\t<key>\t<counter>" for file bytes [from, to),
+ * the counter block of a byte being <counter> (8 bytes) then (offset - <nca>) / 16, big-endian. What is read of
+ * those bytes is decrypted here, with the processor's AES instructions (every x86-64 processor since 2011 has
+ * them; without them the game says so at start and the installer's decrypted copy is the way). Without a
+ * romfs.crypt nothing here runs. */
+typedef struct { u64 from, to, nca; u8 rk[11][16]; u8 ctr[8]; } RomCrypt;
+static struct { RomCrypt *v; u32 n; } rom_crypt[ROM_SOURCES + 1];   /* by source; the last: the plain image's file */
+static char rom_paths[ROM_SOURCES + 1][1024];
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#ifdef _WIN32
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#endif
+#define ROM_AES __attribute__((target("aes,sse4.1")))
+static int rom_aes_ok(void) {
+#ifdef _WIN32
+    int r[4];
+    __cpuid(r, 1);
+    return (r[2] >> 25) & 1;
+#else
+    unsigned a, b, c, d;
+    return __get_cpuid(1, &a, &b, &c, &d) && ((c >> 25) & 1);
+#endif
+}
+ROM_AES static __m128i rom_aes_next(__m128i k, __m128i g) {
+    g = _mm_shuffle_epi32(g, 0xFF);
+    k = _mm_xor_si128(k, _mm_slli_si128(k, 4));
+    k = _mm_xor_si128(k, _mm_slli_si128(k, 4));
+    k = _mm_xor_si128(k, _mm_slli_si128(k, 4));
+    return _mm_xor_si128(k, g);
+}
+ROM_AES static void rom_aes_key(const u8 *key, u8 rk[11][16]) {
+    __m128i k = _mm_loadu_si128((const __m128i *)key);
+    _mm_storeu_si128((__m128i *)rk[0], k);
+#define ROM_AES_STEP(i, rcon) k = rom_aes_next(k, _mm_aeskeygenassist_si128(k, rcon)); _mm_storeu_si128((__m128i *)rk[i], k);
+    ROM_AES_STEP(1, 0x01) ROM_AES_STEP(2, 0x02) ROM_AES_STEP(3, 0x04) ROM_AES_STEP(4, 0x08) ROM_AES_STEP(5, 0x10)
+    ROM_AES_STEP(6, 0x20) ROM_AES_STEP(7, 0x40) ROM_AES_STEP(8, 0x80) ROM_AES_STEP(9, 0x1B) ROM_AES_STEP(10, 0x36)
+#undef ROM_AES_STEP
+}
+ROM_AES static __m128i rom_aes_counter(const RomCrypt *c, u64 block) {
+    u8 iv[16];
+    memcpy(iv, c->ctr, 8);
+    for (int i = 0; i < 8; i++) iv[8 + i] = (u8)(block >> (56 - 8 * i));
+    return _mm_loadu_si128((const __m128i *)iv);
+}
+/* p[0..n): the bytes at offset pos of the NCA, decrypted in place (CTR: the same for encrypting). */
+ROM_AES static void rom_aes_ctr(const RomCrypt *c, u64 pos, u8 *p, u64 n) {
+    __m128i rk[11];
+    for (int i = 0; i < 11; i++) rk[i] = _mm_loadu_si128((const __m128i *)c->rk[i]);
+    u64 block = pos >> 4;
+    u32 skip = (u32)(pos & 15);
+    while (n) {
+        if (!skip && n >= 64) {   /* four blocks at a time: the processor runs their rounds side by side */
+            __m128i s0 = _mm_xor_si128(rom_aes_counter(c, block), rk[0]), s1 = _mm_xor_si128(rom_aes_counter(c, block + 1), rk[0]);
+            __m128i s2 = _mm_xor_si128(rom_aes_counter(c, block + 2), rk[0]), s3 = _mm_xor_si128(rom_aes_counter(c, block + 3), rk[0]);
+            for (int i = 1; i < 10; i++) {
+                s0 = _mm_aesenc_si128(s0, rk[i]); s1 = _mm_aesenc_si128(s1, rk[i]);
+                s2 = _mm_aesenc_si128(s2, rk[i]); s3 = _mm_aesenc_si128(s3, rk[i]);
+            }
+            s0 = _mm_aesenclast_si128(s0, rk[10]); s1 = _mm_aesenclast_si128(s1, rk[10]);
+            s2 = _mm_aesenclast_si128(s2, rk[10]); s3 = _mm_aesenclast_si128(s3, rk[10]);
+            __m128i *q = (__m128i *)p;
+            _mm_storeu_si128(q, _mm_xor_si128(_mm_loadu_si128(q), s0));
+            _mm_storeu_si128(q + 1, _mm_xor_si128(_mm_loadu_si128(q + 1), s1));
+            _mm_storeu_si128(q + 2, _mm_xor_si128(_mm_loadu_si128(q + 2), s2));
+            _mm_storeu_si128(q + 3, _mm_xor_si128(_mm_loadu_si128(q + 3), s3));
+            p += 64; n -= 64; block += 4;
+            continue;
+        }
+        __m128i s = _mm_xor_si128(rom_aes_counter(c, block), rk[0]);
+        for (int i = 1; i < 10; i++) s = _mm_aesenc_si128(s, rk[i]);
+        s = _mm_aesenclast_si128(s, rk[10]);
+        u8 ks[16];
+        _mm_storeu_si128((__m128i *)ks, s);
+        u32 m = 16 - skip < n ? 16 - skip : (u32)n;
+        for (u32 i = 0; i < m; i++) p[i] ^= ks[skip + i];
+        p += m; n -= m; skip = 0; block++;
+    }
+}
+#else
+static int rom_aes_ok(void) { return 0; }
+static void rom_aes_key(const u8 *key, u8 rk[11][16]) { (void)key; (void)rk; }
+static void rom_aes_ctr(const RomCrypt *c, u64 pos, u8 *p, u64 n) { (void)c; (void)pos; (void)p; (void)n; }
+#endif
+
+/* pread_all of a RomFS source, with what romfs.crypt says is encrypted of it decrypted. */
+static int rom_src_read(u32 src, HANDLE h, u64 offset, void *buf, u64 size) {
+    if (!pread_all(h, offset, buf, size)) return 0;
+    for (u32 k = 0; k < rom_crypt[src].n; k++) {
+        const RomCrypt *c = &rom_crypt[src].v[k];
+        u64 lo = offset > c->from ? offset : c->from, hi = offset + size < c->to ? offset + size : c->to;
+        if (lo < hi) rom_aes_ctr(c, lo - c->nca, (u8 *)buf + (lo - offset), hi - lo);
+    }
+    return 1;
+}
+
+static int rom_same_path(const char *a, const char *b) {
+    for (;; a++, b++) {
+        char x = *a == '/' ? '\\' : *a, y = *b == '/' ? '\\' : *b;
+        if (x >= 'A' && x <= 'Z') x += 32;
+        if (y >= 'A' && y <= 'Z') y += 32;
+        if (x != y) return 0;
+        if (!x) return 1;
+    }
+}
+
+static int rom_hex(const char *s, u8 *out, u32 n) {
+    for (u32 i = 0; i < n; i++) {
+        unsigned v;
+        if (sscanf(s + 2 * i, "%2x", &v) != 1) return 0;
+        out[i] = (u8)v;
+    }
+    return 1;
+}
+
+/* romfs.crypt beside romfs.cfg, once the sources are open (rom_paths: their names as romfs.cfg has them). */
+static void rom_crypt_open(void) {
+    char path[1100], line[2048];
+    snprintf(path, sizeof path, "%s/romfs.crypt", rt_data_dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    u32 found = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *tab = strchr(line, '\t');
+        if (!tab) continue;
+        *tab = 0;
+        unsigned long long from, to, nca;
+        char key[40], ctr[24];
+        if (sscanf(tab + 1, "%llu\t%llu\t%llu\t%32s\t%16s", &from, &to, &nca, key, ctr) != 5 || strlen(key) != 32 || strlen(ctr) != 16) continue;
+        for (u32 s = 0; s <= ROM_SOURCES; s++) {
+            if (!rom_paths[s][0] || !rom_same_path(rom_paths[s], line)) continue;
+            RomCrypt *c;
+            u8 k[16];
+            rom_crypt[s].v = realloc(rom_crypt[s].v, sizeof *c * (rom_crypt[s].n + 1));
+            c = &rom_crypt[s].v[rom_crypt[s].n];
+            c->from = from; c->to = to; c->nca = nca;
+            if (!rom_hex(key, k, 16) || !rom_hex(ctr, c->ctr, 8)) rt_fatal("%s: a line's key cannot be read", path);
+            rom_aes_key(k, c->rk);
+            rom_crypt[s].n++;
+            found++;
+        }
+    }
+    fclose(f);
+    if (!found) return;
+    if (!rom_aes_ok())
+        rt_fatal("the game's data is read in place from the game's own encrypted file (%s), which needs a processor with AES "
+                 "instructions: this one has none. Run the installer again without SSBU_DATA_IN_PLACE (it makes a decrypted copy).", path);
+    fprintf(stderr, "[fs] RomFS: %u encrypted region%s of the game's own file read in place, decrypted as read (%s)\n", found, found == 1 ? "" : "s", path);
+}
+
 /* Read image bytes [at, at + size). */
 static int rom_read(u64 at, void *buf, u64 size) {
-    if (!rom.layers) return pread_all(rom.file, rom.base + at, buf, size);
+    if (!rom.layers) return rom_src_read(ROM_SOURCES, rom.file, rom.base + at, buf, size);
     if (at + size > rom.size) return 0;
     u32 lo = 0, hi = rom.nlayers;   /* the last layer starting at or before `at` */
     while (hi - lo > 1) {
@@ -94,7 +253,7 @@ static int rom_read(u64 at, void *buf, u64 size) {
         u64 end = k + 1 < rom.nlayers ? rom.layers[k + 1].at : rom.size;
         u64 n = end - at < size ? end - at : size;
         if (l->src == LAYER_ZERO) memset(p, 0, n);
-        else if (!pread_all(rom.sources[l->src], l->off + (at - l->at), p, n)) return 0;
+        else if (!rom_src_read(l->src, rom.sources[l->src], l->off + (at - l->at), p, n)) return 0;
         p += n; at += n; size -= n;
     }
     return 1;
@@ -157,8 +316,9 @@ static void rom_open(void) {
         u32 n = 0;
         while (n < ROM_SOURCES && fgets(path, sizeof path, f)) {
             path[strcspn(path, "\r\n")] = 0;
-            if (path[0]) rom.sources[n++] = rom_file_open(path);
+            if (path[0]) { snprintf(rom_paths[n], sizeof rom_paths[n], "%s", path); rom.sources[n++] = rom_file_open(path); }
         }
+        rom_crypt_open();
         HANDLE m = rom_file_open(map);
         u8 head[24];
         if (!pread_all(m, 0, head, sizeof head) || memcmp(head, "SSBUROM1", 8)) rt_fatal("%s: not a layer map", map);
@@ -174,6 +334,8 @@ static void rom_open(void) {
     } else {
         if (fscanf(f, "%llu", &rom.base) != 1) rt_fatal("cannot read %s", cfg);
         rom.file = rom_file_open(path);
+        snprintf(rom_paths[ROM_SOURCES], sizeof rom_paths[ROM_SOURCES], "%s", path);
+        rom_crypt_open();
     }
     fclose(f);
     rom_unverified_note();
@@ -228,8 +390,11 @@ typedef struct Handle {
     u32 mount;                /* the mount's id */
     HANDLE host;              /* host file */
     char texture_path[600];
+    int system_save;          /* the game's system save (system_data.bin): its text language is the chosen one */
     u64 offset, size;         /* rom file: data offset in the RomFS image and length */
     char **names; u8 *types; u64 *sizes; i64 count, next;   /* directory listing */
+    size_t list_cap;
+    int list_failed;
 } Handle;
 static Handle handles[512];
 static CRITICAL_SECTION lock;      /* the mount and handle tables */
@@ -398,20 +563,74 @@ static void host_path(char *out, size_t n, struct Mount *m, const char *rest) {
  * handle that existed at that mark has been closed since (the last 256 such closes are kept; older ones count as
  * yes). Off, nothing is counted. */
 static u64 rb_seq;
-static u64 rb_closes[256][2];   /* (when closed, when opened) */
+static u64 rb_closes[256][3];   /* (when closed, when opened, 1: a read-only RomFS file a state puts back: fs_rb_save) */
 static u32 rb_nclose;
 static int rb_fs = -1;
 static u64 rb_born[512];        /* (by slot) when its handle was opened */
 int kernel_rb_switch(void);   /* (kernel.c: SSBU_RB, or run-ahead) */
 static int rb_fs_on(void) { if (rb_fs < 0) rb_fs = kernel_rb_switch(); return rb_fs; }
+/* SSBU_RB_IO_TRACE=1 (test aid, off by default): every handle opened and closed while rollback counts them, with the
+ * guest path and the count, to name the file behind a "LOAD refused: a game file open at the save was closed since" */
+static int rb_io_trace = -1;
+static __declspec(thread) const char *rb_trace_path;   /* (the path the open being made names) */
+static int rb_io_tracing(void) {
+    if (rb_io_trace < 0) { const char *e = getenv("SSBU_RB_IO_TRACE"); rb_io_trace = e && *e == '1'; }
+    return rb_io_trace;
+}
+/* (2026-11-20) SSBU_RB_FS_ROM (default on; =0: off, every close refuses as before): a read-only file of the game's RomFS
+ * (rom:/data.arc, the resource loader's) is no host state at all - its handle is a slot holding an offset and a size into
+ * the image this file already has open. A state keeps the RomFS handles open at its save (fs_rb_save) and its load puts
+ * them back in their slots (fs_rb_load), and frees the RomFS handles opened since, which belong to the frames the load
+ * undoes. So closing one no longer makes every older state unloadable: the resource loader opens and closes data.arc five
+ * times for a load in the middle of a fight (30 s before a timed match's end), and a wrong guess just before that found no
+ * state it could load (the Local Wireless room desync of 2026-11-19). Other handles (save files, the host's files) keep the
+ * rule above. */
+static int rb_fs_rom = -1;
+static int rb_fs_rom_on(void) { if (rb_fs_rom < 0) { const char *e = getenv("SSBU_RB_FS_ROM"); rb_fs_rom = !(e && *e == '0'); } return rb_fs_rom; }
+static int rb_rom_handle(const Handle *h) {   /* (the lock held) */
+    if (!rb_fs_rom_on() || !h->used || h->kind != FILE_ENTRY || h->host || (h->mode & OPEN_WRITE) || h->system_save || h->names) return 0;
+    for (int m = 0; m < 16; m++) if (mounts[m].id == h->mount) return mounts[m].kind == M_ROM;
+    return 0;
+}
+typedef struct FsRomRec { u32 slot, mount; int mode; u64 born, offset, size; } FsRomRec;
+typedef struct FsRomSave { u32 n; FsRomRec r[]; } FsRomSave;
 static void rb_closing(const Handle *h) {   /* (the lock held) */
     if (!rb_fs_on()) return;
     u32 i = (u32)(h - handles);
     u32 k = rb_nclose++ % 256;
-    rb_closes[k][0] = ++rb_seq; rb_closes[k][1] = i < 512 ? rb_born[i] : 0;
+    rb_closes[k][0] = ++rb_seq; rb_closes[k][1] = i < 512 ? rb_born[i] : 0; rb_closes[k][2] = rb_rom_handle(h);
+    if (rb_io_tracing()) fprintf(stderr, "[rb-io] close: handle %u (opened at #%llu) closed at #%llu\n", i, (unsigned long long)rb_closes[k][1],
+                                 (unsigned long long)rb_seq);
 }
 u64 fs_rb_mark(void) { ready(); EnterCriticalSection(&lock); u64 m = rb_seq; LeaveCriticalSection(&lock); return m; }
-int fs_rb_closed_since(u64 mark) {
+/* the RomFS handles open now, for a state (hle_rb_state.c rb_save; NULL: none, or SSBU_RB_FS_ROM=0) */
+static u64 rb_last_save_seq;   /* (the count at the newest state's save: a handle opened after it closes freely) */
+void *fs_rb_save(void) {
+    if (!rb_fs_on()) return NULL;
+    ready();
+    EnterCriticalSection(&lock); rb_last_save_seq = rb_seq; LeaveCriticalSection(&lock);
+    if (!rb_fs_rom_on()) return NULL;
+    EnterCriticalSection(&lock);
+    u32 n = 0;
+    for (u32 i = 1; i < 512; i++) n += rb_rom_handle(&handles[i]);
+    FsRomSave *f = n ? malloc(sizeof *f + n * sizeof f->r[0]) : NULL;
+    if (f) {
+        f->n = 0;
+        for (u32 i = 1; i < 512; i++)
+            if (rb_rom_handle(&handles[i]))
+                f->r[f->n++] = (FsRomRec){ i, handles[i].mount, handles[i].mode, rb_born[i], handles[i].offset, handles[i].size };
+    }
+    LeaveCriticalSection(&lock);
+    return f;
+}
+static const FsRomRec *rom_saved(const FsRomSave *f, u32 slot, u64 born) {
+    for (u32 j = 0; f && j < f->n; j++) if (f->r[j].slot == slot && f->r[j].born == born) return &f->r[j];
+    return NULL;
+}
+/* Whether a handle open at the save (mark) was closed since and cannot be put back: a RomFS one kept in the state
+ * (fs: fs_rb_save's) can, unless its slot now holds another kind of handle. */
+int fs_rb_closed_since(u64 mark, const void *fs) {
+    const FsRomSave *f = fs;
     int yes = 0;
     ready();
     EnterCriticalSection(&lock);
@@ -419,12 +638,43 @@ int fs_rb_closed_since(u64 mark) {
     for (u32 j = 0; j < n && !yes; j++) {
         const u64 *c = rb_closes[(rb_nclose - 1 - j) % 256];
         if (c[0] <= mark) break;   /* (newest first: the rest are older than the mark) */
-        if (c[1] <= mark) yes = 1;
+        if (c[1] <= mark && !(c[2] && f)) yes = 1;
         if (j == 255) yes = 1;     /* (more closes since than kept) */
+    }
+    for (u32 j = 0; f && j < f->n && !yes; j++) {   /* (a slot kept that a host or save handle took since) */
+        const Handle *h = &handles[f->r[j].slot];
+        if (h->used && rb_born[f->r[j].slot] != f->r[j].born && !rb_rom_handle(h)) yes = 1;
     }
     LeaveCriticalSection(&lock);
     return yes;
 }
+/* A load (after fs_rb_closed_since said no): the state's RomFS handles back in their slots, the RomFS handles opened
+ * since its save freed. Returns how many were put back or freed. */
+static long long rb_fs_put_back, rb_fs_freed;
+int fs_rb_load(const void *fs, u64 mark) {
+    const FsRomSave *f = fs;
+    if (!rb_fs_on() || !rb_fs_rom_on()) return 0;
+    int k = 0;
+    ready();
+    EnterCriticalSection(&lock);
+    for (u32 i = 1; i < 512; i++)
+        if (rb_born[i] > mark && rb_rom_handle(&handles[i]) && !rom_saved(f, i, rb_born[i])) {
+            memset(&handles[i], 0, sizeof handles[i]); rb_born[i] = 0; k++; rb_fs_freed++;
+            if (rb_io_tracing()) fprintf(stderr, "[rb-io] load: RomFS handle %u opened since the state freed\n", i);
+        }
+    for (u32 j = 0; f && j < f->n; j++) {
+        const FsRomRec *r = &f->r[j];
+        Handle *h = &handles[r->slot];
+        if (h->used && rb_born[r->slot] == r->born) continue;   /* (still open) */
+        memset(h, 0, sizeof *h);
+        h->used = 1; h->kind = FILE_ENTRY; h->mode = r->mode; h->mount = r->mount; h->offset = r->offset; h->size = r->size;
+        rb_born[r->slot] = r->born; k++; rb_fs_put_back++;
+        if (rb_io_tracing()) fprintf(stderr, "[rb-io] load: RomFS handle %u (opened at #%llu) put back\n", r->slot, (unsigned long long)r->born);
+    }
+    LeaveCriticalSection(&lock);
+    return k;
+}
+void fs_rb_counts(long long *put_back, long long *freed) { *put_back = rb_fs_put_back; *freed = rb_fs_freed; }
 
 static u64 new_handle(Handle h) {
     EnterCriticalSection(&lock);
@@ -433,6 +683,9 @@ static u64 new_handle(Handle h) {
             handles[i] = h;
             handles[i].used = 1;
             if (rb_fs_on()) rb_born[i] = ++rb_seq;
+            if (rb_fs_on() && rb_io_tracing())
+                fprintf(stderr, "[rb-io] open: handle %u at #%llu: %s %s\n", i, (unsigned long long)rb_seq, h.kind == DIR_ENTRY ? "directory" : "file",
+                        rb_trace_path ? rb_trace_path : "?");
             LeaveCriticalSection(&lock);
             return 0x46530000ull | i;
         }
@@ -462,9 +715,10 @@ static const char *data_root(char *out, size_t n, const char *leaf) {   /* nativ
  *     deletions are remembered (tombstones). Every open, listing and query sees the working
  *     folder over the committed one, without the deleted paths.
  *   - Commit flushes the changed files, writes the list of changes to the journal
- *     save/<user>.journal.<process id>, flushes it and renames it to save/<user>.commit: the
- *     commit is decided there. Then the changes are applied (deletions, new folders, each file
- *     moved over the committed one) and that marker deleted. Every step can be done again, so
+ *     save/<user>.journal.<process id>, flushes it and renames it to save/<user>.commit (never
+ *     over another): the commit is decided there. Once that name is flushed to the disk, the
+ *     changes are applied (deletions, new folders, each file moved over the committed one) and
+ *     that marker deleted; a flush that fails leaves the commit pending, applied later. Every step can be done again, so
  *     a process stopped after the rename has its commit finished by the next mount, by any
  *     process; one stopped before leaves the committed save as it was.
  *   - Unmount discards uncommitted changes, as the console does; so does the next mount, for
@@ -478,7 +732,10 @@ static const char *data_root(char *out, size_t n, const char *leaf) {   /* nativ
  * Windows a committed file still open for reading is replaced as POSIX does it, and a read-only
  * mark is cleared first.
  * One process at a time commits or recovers: a lock file beside the save (save/<user>.lock),
- * on Windows a named mutex. One process mounts a save once. */
+ * on Windows a named mutex. When the lock cannot be taken the journal goes on without it, as it
+ * always did, and says so in the log; with SSBU_FS_LOCK_STRICT=1 nothing is done without it: the
+ * mount fails, Commit fails and a decided commit waits (another process may be applying it). One
+ * process mounts a save once. */
 #define SHARE_ALL (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)   /* (a commit can move a file someone reads) */
 #define JOURNAL_FORMAT "ssbu-save-journal 1"   /* the journal's first line */
 #ifndef ERROR_SHARING_VIOLATION
@@ -489,13 +746,18 @@ static const char *data_root(char *out, size_t n, const char *leaf) {   /* nativ
 #endif
 
 #ifdef _WIN32
-typedef HANDLE SaveLock;
+typedef HANDLE SaveLock;   /* (NULL: not taken) */
 static SaveLock lock_saves(const char *root) {
     (void)root;
     HANDLE mx = CreateMutexA(NULL, FALSE, "Local\\ssbu-save-journal");
-    if (mx) WaitForSingleObject(mx, INFINITE);   /* (WAIT_ABANDONED: its holder died; it is ours now) */
-    return mx;
+    DWORD w = mx ? WaitForSingleObject(mx, INFINITE) : WAIT_FAILED;
+    if (w == WAIT_OBJECT_0 || w == WAIT_ABANDONED) return mx;   /* (WAIT_ABANDONED: its holder died; it is ours now) */
+    DWORD err = GetLastError();
+    if (mx) CloseHandle(mx);
+    SetLastError(err);
+    return NULL;
 }
+static int saves_locked(SaveLock mx) { return mx != NULL; }
 static void unlock_saves(SaveLock mx) { if (mx) { ReleaseMutex(mx); CloseHandle(mx); } }
 static int pid_alive(DWORD pid) {
     HANDLE p = OpenProcess(SYNCHRONIZE, FALSE, pid);
@@ -509,29 +771,63 @@ static int pid_alive(DWORD pid) {
  * goes to the disk within seconds, not when MoveFileEx returns (MOVEFILE_WRITE_THROUGH is
  * documented for moves done as a copy): a power cut just after a commit can bring back the save
  * before it, whole. */
-static void flush_dir(const char *path) { (void)path; }
+static int flush_dir(const char *path) { (void)path; return 1; }
 #else
-typedef int SaveLock;
+typedef int SaveLock;   /* (-1: not taken) */
 static SaveLock lock_saves(const char *root) {   /* (flock: the shim's objects have no names) */
     char path[1024], unix_path[1024];
     snprintf(path, sizeof path, "%s.lock", root);
-    int fd = open(rt_unix_path(path, unix_path, sizeof unix_path), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-    if (fd >= 0) while (flock(fd, LOCK_EX) && errno == EINTR) {}
+    int fd = open(rt_unix_path(path, unix_path, sizeof unix_path), O_RDWR | O_CREAT | O_CLOEXEC, 0644), r = -1;
+    if (fd < 0 && (errno == EACCES || errno == EROFS))   /* (flock needs no write access: a lock file left read-only, or another user's) */
+        fd = open(unix_path, O_RDONLY | O_CLOEXEC);
+    while (fd >= 0 && (r = flock(fd, LOCK_EX)) && errno == EINTR) {}
+    if (fd >= 0 && r) { int err = errno; close(fd); errno = err; fd = -1; }
+    if (fd < 0) SetLastError(rt_win32_error(errno));
     return fd;
 }
+static int saves_locked(SaveLock fd) { return fd >= 0; }
 static void unlock_saves(SaveLock fd) { if (fd >= 0) close(fd); }
 static int pid_alive(DWORD pid) { return pid && pid <= 0x7FFFFFFF && (kill((pid_t)pid, 0) == 0 || errno == EPERM); }
-static void flush_dir(const char *path) {   /* the names in a folder: POSIX makes them durable only so */
+/* The names in a folder: POSIX makes them durable only so. 0 if that failed (an I/O error). Some
+ * file systems cannot flush a folder at all (EINVAL, ENOTSUP, ENOSYS: some network and FUSE
+ * ones): there the save goes on as it did before folders were flushed, with no promise about a
+ * power cut, said once in the log - failing would leave the save unmountable for good. */
+static int flush_dir(const char *path) {
+    static int unflushable_said;
     char unix_path[1024];
-    int fd = open(rt_unix_path(path, unix_path, sizeof unix_path), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return;
+    int fd = open(rt_unix_path(path, unix_path, sizeof unix_path), O_RDONLY | O_CLOEXEC), r = -1;
+    if (fd < 0) { SetLastError(rt_win32_error(errno)); return 0; }
 #ifdef __APPLE__
-    if (fcntl(fd, F_FULLFSYNC))   /* (fsync leaves it in the drive's cache) */
+    if ((r = fcntl(fd, F_FULLFSYNC)))   /* (fsync leaves it in the drive's cache) */
 #endif
-        fsync(fd);
+        r = fsync(fd);
+    int err = errno;
     close(fd);
+    if (r && (err == EINVAL || err == ENOTSUP || err == ENOSYS)) {
+        if (!__atomic_exchange_n(&unflushable_said, 1, __ATOMIC_RELAXED))
+            fprintf(stderr, "[fs] %s: this file system cannot flush a folder (errno %d); saves go on without it\n", path, err);
+        return 1;
+    }
+    if (r) { fprintf(stderr, "[fs] %s: flushing the folder failed (errno %d)\n", path, err); SetLastError(rt_win32_error(err)); }
+    return !r;
 }
 #endif
+
+/* Whether to go on when the save lock was not taken (`refused` says what is not done otherwise).
+ * By default yes, as before the lock could fail: one process loses nothing, only two at once
+ * could apply or drop each other's commit. SSBU_FS_LOCK_STRICT=1 refuses instead. It is not the
+ * default because a file system without locks (NFS without its lock daemon: ENOLCK) or a
+ * non-file where the lock file goes would then leave the save unmountable. (Read at each call:
+ * fstest switches it.) */
+static int saves_go_on(SaveLock l, const char *root, const char *refused) {
+    if (saves_locked(l)) return 1;
+    DWORD err = GetLastError();
+    const char *e = getenv("SSBU_FS_LOCK_STRICT");
+    int strict = e && !strcmp(e, "1");
+    fprintf(stderr, "[fs] %s: the save lock could not be taken (error %lu): %s\n", root, (unsigned long)err,
+            strict ? refused : "going on without it (SSBU_FS_LOCK_STRICT=1 refuses)");
+    return !strict;
+}
 
 #ifdef FS_TEST
 /* tools/dev/fstest.c: SSBU_FS_CRASH_AT=n ends the process at the n-th of these, as a crash would */
@@ -549,6 +845,11 @@ static void crash_point(void) {
 #endif
 
 static DWORD attributes(const char *p) { return GetFileAttributesA(p); }
+static int absent(const char *p) {   /* nothing there - not a path that could not be looked at (no access, a disk error) */
+    if (attributes(p) != INVALID_FILE_ATTRIBUTES) return 0;
+    DWORD e = GetLastError();
+    return e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND;
+}
 static int is_dir(const char *p) { DWORD a = attributes(p); return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY); }
 static int is_file(const char *p) { DWORD a = attributes(p); return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY); }
 static void join(char *out, size_t n, const char *dir, const char *rel) {   /* (dir "": rel alone) */
@@ -604,6 +905,15 @@ static int move_file(const char *from, const char *to) {
     not_read_only(to);
     for (DWORD wait = 1;; wait *= 2) {
         if (MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) || replace_open_file(from, to)) return 1;
+        if (!held() || wait > 512) return 0;
+        Sleep(wait);
+    }
+}
+/* A move that never replaces (0 if something is at `to`), on the disk when it returns: the
+ * journal becoming the marker. */
+static int move_new(const char *from, const char *to) {
+    for (DWORD wait = 1;; wait *= 2) {
+        if (MoveFileExA(from, to, MOVEFILE_WRITE_THROUGH)) return 1;
         if (!held() || wait > 512) return 0;
         Sleep(wait);
     }
@@ -780,8 +1090,8 @@ static void journal_deletes(Text *t, struct Mount *m, const char *rel) {
     FindClose(h);
 }
 
-/* Every folder (M) and file (F) of the working folder, parents first; each file flushed.
- * 0 if one could not be. */
+/* Every folder (M) and file (F) of the working folder, parents first; each file and folder
+ * flushed. 0 if one could not be: the commit then fails before it is decided. */
 static int journal_work(Text *t, const char *work, const char *rel) {
     char dir[1024], pat[1024], sub[512], full[1024];
     WIN32_FIND_DATAA fd;
@@ -805,7 +1115,7 @@ static int journal_work(Text *t, const char *work, const char *rel) {
         }
     } while (FindNextFileA(h, &fd));
     FindClose(h);
-    flush_dir(dir);
+    ok &= flush_dir(dir);
     return ok;
 }
 
@@ -822,8 +1132,8 @@ static int journal_apply(const char *root) {
     char marker[1024], parent[1024], work[1024] = "", a[1024], b[1024];
     snprintf(marker, sizeof marker, "%s.commit", root);
     parent_of(parent, sizeof parent, root);
-    if (attributes(marker) == INVALID_FILE_ATTRIBUTES) return 1;
-    char *text = read_text(marker);
+    if (absent(marker)) return 1;
+    char *text = read_text(marker);   /* (NULL too when the marker could not be looked at: tried again later) */
     if (!text) return -1;
     size_t len = strlen(text), head = strlen(JOURNAL_FORMAT "\n");
     if (len < head + 2 || memcmp(text, JOURNAL_FORMAT "\n", head) || strcmp(text + len - 2, "E\n") || (len > head + 2 && text[len - 3] != '\n')) {
@@ -832,6 +1142,11 @@ static int journal_apply(const char *root) {
         if (!delete_file(marker)) return -1;
         flush_dir(parent);
         return 0;
+    }
+    if (!flush_dir(parent)) {   /* (nothing moved over the committed save before the marker's name is on the disk) */
+        free(text);
+        fprintf(stderr, "[fs] %s: the save's folder could not be flushed (error %lu); applied later\n", marker, (unsigned long)GetLastError());
+        return -1;
     }
     int ok = 1;
     for (char *line = text + head, *next; ok && *line; line = next) {
@@ -849,21 +1164,20 @@ static int journal_apply(const char *root) {
         join(a, sizeof a, root, arg);
         if (!strcmp(line, "Dd")) {   /* a folder that goes */
             if (is_dir(a)) remove_tree(a);
-            ok = !is_dir(a);
             parent_of(b, sizeof b, a);
-            flush_dir(b);
+            ok = !is_dir(a) && (!is_dir(b) || flush_dir(b));   /* (an I/O error fails the step: the marker must not go before it is on the disk) */
         } else if (!strcmp(line, "Df")) {   /* a file that goes */
             ok = !is_file(a) || delete_file(a);
             parent_of(b, sizeof b, a);
-            flush_dir(b);
+            ok = ok && (!is_dir(b) || flush_dir(b));
         } else if (!strcmp(line, "M")) {   /* a folder the save has now */
             if (!is_dir(a)) { make_parents(a); CreateDirectoryA(a, NULL); }
-            ok = is_dir(a);
             parent_of(b, sizeof b, a);
-            flush_dir(b);
+            ok = is_dir(a) && flush_dir(b);
         } else if (!strcmp(line, "F")) {   /* a file: the working copy moves over the committed one */
             join(b, sizeof b, work, arg);
-            if (attributes(b) != INVALID_FILE_ATTRIBUTES) { make_parents(a); ok = move_file(b, a); }
+            if (!absent(b)) { make_parents(a); ok = move_file(b, a); }   /* (absent: moved already; one that cannot be looked at fails the move) */
+            else { parent_of(b, sizeof b, a); ok = !is_dir(b) || flush_dir(b); }   /* (moved by a try whose flush failed: flushed now, before the marker goes) */
         } else ok = 0;
         crash_point();
     }
@@ -874,7 +1188,8 @@ static int journal_apply(const char *root) {
     }
     crash_point();
     if (!delete_file(marker)) return -1;
-    flush_dir(parent);   /* (before anything else goes into the working folder: the marker must not be applied twice) */
+    flush_dir(parent);   /* (before anything else goes into the working folder: the marker must not be applied twice.
+                          * An I/O error here is logged, not a failure: the commit is applied, and its marker gone) */
     crash_point();
     return 1;
 }
@@ -892,7 +1207,7 @@ static void journal_done(struct Mount *m) {
 static int journal_settle(struct Mount *m) {
     if (!m->pending) return 1;
     SaveLock l = lock_saves(m->root);
-    if (journal_apply(m->root) >= 0) journal_done(m);
+    if (saves_go_on(l, m->root, "a decided commit waits") && journal_apply(m->root) >= 0) journal_done(m);
     unlock_saves(l);
     return !m->pending;
 }
@@ -937,10 +1252,21 @@ static int writer_open(u32 mount) {   /* a file of the mount is open for writing
     return found;
 }
 
+/* Whether the marker is this process's journal: it starts as journal_commit writes one, with this
+ * process's id on its W line. (Not readable: not known to be, so not.) */
+static int marker_is_mine(const char *marker, const char *pid) {
+    char want[64], *text = read_text(marker);
+    snprintf(want, sizeof want, "%s\nW\t%s\n", JOURNAL_FORMAT, pid);
+    int mine = text && !strncmp(text, want, strlen(want));
+    free(text);
+    return mine;
+}
+
 static u32 journal_commit(struct Mount *m) {
     char journal[1024], marker[1024], pid[16];
     if (writer_open(m->id)) return R_WRITE_FILE_OPEN;   /* ([sdk] FileSystemAccessor::Commit refuses too) */
     SaveLock l = lock_saves(m->root);
+    if (!saves_go_on(l, m->root, "the commit is refused")) return R_HOST_FAILURE;
     if (journal_apply(m->root) < 0) { unlock_saves(l); return R_HOST_FAILURE; }   /* (a decided commit first, whichever process made it) */
     if (m->pending) journal_done(m);
     if (!m->ntomb && folder_empty(m->work)) { unlock_saves(l); return 0; }   /* (nothing changed) */
@@ -970,7 +1296,17 @@ static u32 journal_commit(struct Mount *m) {
     } else ok = 0;
     free(t.p);
     crash_point();
-    if (ok && !move_file(journal, marker)) ok = attributes(journal) == INVALID_FILE_ATTRIBUTES && attributes(marker) != INVALID_FILE_ATTRIBUTES;
+    /* the decision: the journal takes the marker's name, never over another marker (journal_apply
+     * above left none). A move that went through but whose flush failed is decided but not known
+     * to be on the disk: left pending, not applied now */
+    int synced = ok && move_new(journal, marker);
+    DWORD move_error = GetLastError();
+    if (ok && !synced) {   /* (journal_apply above left no marker, but without the lock another process may have put its
+                            * own there in between: a marker counts as this decision only if its W line is this process) */
+        ok = marker_is_mine(marker, pid);
+        if (ok && !absent(journal)) DeleteFileA(journal);   /* (a link-then-unlink move cut short: one file under both names) */
+    }
+    SetLastError(move_error);
     if (!ok) {   /* not decided: the committed save is as it was */
         fprintf(stderr, "[fs] commit of %s failed before it was decided (error %lu)\n", m->root, (unsigned long)GetLastError());
         DeleteFileA(journal);
@@ -979,7 +1315,8 @@ static u32 journal_commit(struct Mount *m) {
     }
     crash_point();   /* (decided) */
     m->pending = 1;
-    if (journal_apply(m->root) >= 0) journal_done(m);
+    if (!synced) fprintf(stderr, "[fs] commit of %s decided, but its flush failed (error %lu); applied later\n", m->root, (unsigned long)GetLastError());
+    else if (journal_apply(m->root) >= 0) journal_done(m);
     unlock_saves(l);
     if (!m->pending) fprintf(stderr, "[fs] save committed (%d changes)\n", changes);
     return m->pending ? R_HOST_FAILURE : 0;   /* (pending: every call on the mount tries it again first; the next mount finishes it) */
@@ -1000,7 +1337,7 @@ static u32 journal_mount(const char *name, const char *where) {
     if (!r) {
         make_dirs(root);
         SaveLock l = lock_saves(root);
-        r = journal_recover(root);
+        r = saves_go_on(l, root, "the save is not mounted") ? journal_recover(root) : R_HOST_FAILURE;   /* (strict: nothing recovered or dropped without it) */
         if (!r) {   /* (left by a process that had this number before) */
             snprintf(work, sizeof work, "%s.work.%lu", root, (unsigned long)GetCurrentProcessId());
             snprintf(journal, sizeof journal, "%s.journal.%lu", root, (unsigned long)GetCurrentProcessId());
@@ -1078,7 +1415,7 @@ static int listing_host(Handle *h, const char *dir, int mode, struct Mount *m, c
         while (k < h->count && _stricmp(h->names[k], fd.cFileName)) k++;
         if (k < h->count) { h->types[k] = isdir ? DIR_ENTRY : FILE_ENTRY; h->sizes[k] = size; }
         else listing_add(h, fd.cFileName, strlen(fd.cFileName), isdir ? DIR_ENTRY : FILE_ENTRY, size);
-    } while (FindNextFileA(fh, &fd));
+    } while (!h->list_failed && FindNextFileA(fh, &fd));
     FindClose(fh);
     return 1;
 }
@@ -1091,7 +1428,7 @@ static u32 save_list(struct Mount *m, const char *rest, int mode, Handle *h) {  
     if (!tomb_hides(m, rel)) { join(path, sizeof path, m->root, rel); listing_host(h, path, mode, m, rel, 0); }
     join(path, sizeof path, m->work, rel);
     listing_host(h, path, mode, NULL, NULL, 1);
-    return 0;
+    return h->list_failed ? R_HOST_FAILURE : 0;
 }
 
 static u32 save_delete(struct Mount *m, const char *rest, int dir) {
@@ -1101,9 +1438,10 @@ static u32 save_delete(struct Mount *m, const char *rest, int dir) {
     if (!rel[0] || view(m, rel, path, sizeof path) != (dir ? 2 : 1)) return R_PATH_NOT_FOUND;
     if (dir) {   /* only an empty folder, as the host's own RemoveDirectory */
         Handle h = {0};
-        save_list(m, rest, LIST_DIRS | LIST_FILES, &h);
+        r = save_list(m, rest, LIST_DIRS | LIST_FILES, &h);
         i64 n = h.count;
         listing_free(&h);
+        if (r) return r;
         if (n) return R_PATH_NOT_FOUND;
     }
     join(path, sizeof path, m->work, rel);
@@ -1218,6 +1556,7 @@ HLE(_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc) {
 HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
     const char *rest;
     ready();
+    rb_trace_path = P(char, c->x[1]);
     struct Mount *m = find_mount(P(char, c->x[1]), &rest);
     int mode = (int)c->x[2];
     if (!m) { c->x[0] = R_NOT_MOUNTED; return; }
@@ -1238,6 +1577,9 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
             h.size = rom_file(f)->size;
         }
     } else if (m->kind == M_SAVE) {
+        const char *leaf = rest;
+        for (const char *s = rest; *s; s++) if (*s == '/' || *s == '\\' || *s == ':') leaf = s + 1;
+        h.system_save = !(mode & OPEN_WRITE) && !_stricmp(leaf, "system_data.bin");
         EnterCriticalSection(&jlock);   /* (held until the handle is in the table: Commit looks for writers there) */
         u32 r = save_open(m, rest, &h);
         u64 v = r ? 0 : new_handle(h);
@@ -1269,6 +1611,27 @@ static u64 file_size(Handle *h) {
     return (u64)s.QuadPart;
 }
 
+/* The game keeps its text language in its system save, written once when the save is made
+ * (language.h), and shows its text in that one whatever language it is given: a save made in
+ * another language (a downloaded one) kept the game in that language (#362). When the player
+ * chose a language, the save is read with that one; the game writes it back at its next save. */
+int save_language_wanted(const char **code);   /* (hle_env.c) */
+static void system_save_language(u64 total, i64 offset, u8 *buf, u64 size) {
+    if (total != LANGUAGE_SAVE_FILE_SIZE || (u64)offset > LANGUAGE_SAVE_OFFSET || LANGUAGE_SAVE_OFFSET - (u64)offset >= size) return;
+    const char *code = NULL;
+    int want = save_language_wanted(&code);
+    u8 *at = buf + (LANGUAGE_SAVE_OFFSET - (u64)offset);
+    static volatile LONG logged;
+    if (want < 0 || *at == (u8)want) {
+        if (!InterlockedExchange(&logged, 1))
+            fprintf(stderr, "[fs] the save's text language: %u%s\n", *at, want < 0 ? " (no language chosen: the save's stays)" : ", the chosen one");
+        return;
+    }
+    if (!InterlockedExchange(&logged, 1))
+        fprintf(stderr, "[fs] the save's text language: %u; read as %d, the chosen language's (%s)\n", *at, want, code);
+    *at = (u8)want;
+}
+
 /* Read up to `size` bytes at `offset`; returns the count, or ~0 on a host error. */
 static u64 read_at(Handle *h, i64 offset, void *buf, u64 size) {
     u64 total = file_size(h);
@@ -1276,6 +1639,7 @@ static u64 read_at(Handle *h, i64 offset, void *buf, u64 size) {
     if (size > total - (u64)offset) size = total - (u64)offset;
     if (!size) return 0;
     int ok = h->host ? pread_all(h->host, (u64)offset, buf, size) : rom_read(h->offset + (u64)offset, buf, size);
+    if (ok && h->system_save) system_save_language(total, offset, buf, size);
     /* Costume inference reads headers, not pixels: only a full load needs a snapshot. */
     if (ok && offset == 0 && size == total && h->texture_path[0]) mod_refresh_file_opened(h->texture_path);
     return ok ? size : ~0ull;
@@ -1311,14 +1675,28 @@ HLE(_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE) {
     st64(c->x[0], file_size(h));
     c->x[0] = 0;
 }
+/* (rollback, SSBU_RB_IO_BARRIER: hle_rb_core.c) A close a load could not undo - a handle open at the newest state's save
+ * that is not a RomFS one put back by the load - waits, in a networked fight, until no rollback can cross it. */
+extern int (*kernel_rb_io_enter)(void *kthread, const char *what);
+extern void (*kernel_rb_io_leave)(int token);
+static int rb_close_barrier(Cpu *c, Handle *h) {
+    if (!kernel_rb_io_enter || !rb_fs_on()) return 0;
+    EnterCriticalSection(&lock);
+    u32 i = (u32)(h - handles);
+    int need = h->used && i < 512 && rb_born[i] <= rb_last_save_seq && !rb_rom_handle(h);
+    LeaveCriticalSection(&lock);
+    return need ? kernel_rb_io_enter(c->thread, "a game file closed") : 0;
+}
 HLE(_ZN2nn2fs9CloseFileENS0_10FileHandleE) {
     Handle *h = get_handle(c->x[0]);
     if (!h) return;
+    int io = rb_close_barrier(c, h);
     if (h->host) CloseHandle(h->host);
     EnterCriticalSection(&lock);
     rb_closing(h);
     memset(h, 0, sizeof *h);
     LeaveCriticalSection(&lock);
+    if (io && kernel_rb_io_leave) kernel_rb_io_leave(io);
 }
 HLE(_ZN2nn2fs10CreateFileEPKcl) {   /* (path, size) */
     const char *rest;
@@ -1403,23 +1781,43 @@ HLE(_ZN2nn2fs15DeleteDirectoryEPKc) {
 
 /* ---- directories ----------------------------------------------------------------- */
 static void listing_add(Handle *h, const char *name, size_t len, int type, u64 size) {
-    h->names = realloc(h->names, sizeof *h->names * (h->count + 1));
-    h->types = realloc(h->types, h->count + 1);
-    h->sizes = realloc(h->sizes, sizeof *h->sizes * (h->count + 1));
-    h->names[h->count] = malloc(len + 1);
-    memcpy(h->names[h->count], name, len);
-    h->names[h->count][len] = 0;
+    if (h->list_failed) return;
+    if ((size_t)h->count == h->list_cap) {
+        /* Large mod directories used to resize all three arrays for every entry. Grow
+         * geometrically; keep every successful allocation owned if a later one fails. */
+        if (h->list_cap > SIZE_MAX / 2 / sizeof *h->names) { h->list_failed = 1; return; }
+        size_t cap = h->list_cap ? h->list_cap * 2 : 32;
+        char **names = realloc(h->names, cap * sizeof *names);
+        if (!names) { h->list_failed = 1; return; }
+        h->names = names;
+        u8 *types = realloc(h->types, cap * sizeof *types);
+        if (!types) { h->list_failed = 1; return; }
+        h->types = types;
+        u64 *sizes = realloc(h->sizes, cap * sizeof *sizes);
+        if (!sizes) { h->list_failed = 1; return; }
+        h->sizes = sizes;
+        h->list_cap = cap;
+    }
+    if (len == SIZE_MAX) { h->list_failed = 1; return; }
+    char *copy = malloc(len + 1);
+    if (!copy) { h->list_failed = 1; return; }
+    memcpy(copy, name, len);
+    copy[len] = 0;
+    h->names[h->count] = copy;
     h->types[h->count] = (u8)type;
     h->sizes[h->count++] = size;
 }
 static void listing_free(Handle *h) {
     for (i64 i = 0; i < h->count; i++) free(h->names[i]);
     free(h->names); free(h->types); free(h->sizes);
+    h->names = NULL; h->types = NULL; h->sizes = NULL;
+    h->count = h->next = 0; h->list_cap = 0; h->list_failed = 0;
 }
 
 HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path, mode) */
     const char *rest;
     ready();
+    rb_trace_path = P(char, c->x[1]);
     struct Mount *m = find_mount(P(char, c->x[1]), &rest);
     int mode = (int)c->x[2];
     if (!m) { c->x[0] = R_NOT_MOUNTED; return; }
@@ -1430,16 +1828,16 @@ HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path,
         u32 d, f;
         if (!rom_lookup(rest, &d, &f) || f != NONE) { c->x[0] = R_PATH_NOT_FOUND; return; }
         if (mode & LIST_DIRS)
-            for (u32 k = rom_dir(d)->child_dir; k != NONE; k = rom_dir(k)->sibling)
+            for (u32 k = rom_dir(d)->child_dir; k != NONE && !h.list_failed; k = rom_dir(k)->sibling)
                 listing_add(&h, rom_dir(k)->name, rom_dir(k)->name_len, DIR_ENTRY, 0);
         if (mode & LIST_FILES)
-            for (u32 k = rom_dir(d)->child_file; k != NONE; k = rom_file(k)->sibling)
+            for (u32 k = rom_dir(d)->child_file; k != NONE && !h.list_failed; k = rom_file(k)->sibling)
                 listing_add(&h, rom_file(k)->name, rom_file(k)->name_len, FILE_ENTRY, rom_file(k)->size);
     } else if (!strcmp(m->name, "sd") && !_strnicmp(rest + strspn(rest, "/"), "ultimate/mods", 13) &&
                (!rest[strspn(rest, "/") + 13] || !strcmp(rest + strspn(rest, "/") + 13, "/"))) {
         load_mods_list();   /* (the turned-on mods only) */
         char flat[4200];
-        for (int i = 0; i < mods_count && (mode & LIST_DIRS); i++) {
+        for (int i = 0; i < mods_count && (mode & LIST_DIRS) && !h.list_failed; i++) {
             mod_folder_name(flat, sizeof flat, mods_list[i]);
             listing_add(&h, flat, strlen(flat), DIR_ENTRY, 0);
         }
@@ -1447,7 +1845,7 @@ HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path,
         /* every turned-on mod's files as one tree: a later mod's entry over an earlier one's */
         load_mods_list();
         int found = 0;
-        for (int i = 0; i < mods_count; i++) {
+        for (int i = 0; i < mods_count && !h.list_failed; i++) {
             char path[4400];
             snprintf(path, sizeof path, "%s/../../mods/%s/%s", rt_data_dir, mods_list[i], rest + strspn(rest, "/"));
             for (char *q = path; *q; q++) if (*q == '/') *q = '\\';
@@ -1465,7 +1863,7 @@ HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path,
                 while (k < h.count && _stricmp(h.names[k], fd.cFileName)) k++;
                 if (k < h.count) { h.types[k] = dir ? DIR_ENTRY : FILE_ENTRY; h.sizes[k] = size; }
                 else listing_add(&h, fd.cFileName, strlen(fd.cFileName), dir ? DIR_ENTRY : FILE_ENTRY, size);
-            } while (FindNextFileA(fh, &fd));
+            } while (!h.list_failed && FindNextFileA(fh, &fd));
             FindClose(fh);
         }
         if (!found) { listing_free(&h); c->x[0] = R_PATH_NOT_FOUND; return; }
@@ -1477,7 +1875,7 @@ HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path,
     } else {
         char path[1024];
         host_path(path, sizeof path, m, rest);
-        if (!listing_host(&h, path, mode, NULL, NULL, 0)) { c->x[0] = R_PATH_NOT_FOUND; return; }
+        if (!listing_host(&h, path, mode, NULL, NULL, 0)) { listing_free(&h); c->x[0] = R_PATH_NOT_FOUND; return; }
         if (!strcmp(m->name, "sd")) {   /* a mod's own copy of a file .characters provides is not shown to ARCropolis */
             for (i64 k = 0; k < h.count; ) {
                 if (h.types[k] == FILE_ENTRY && hidden_from_arcropolis(rest, h.names[k])) {
@@ -1490,6 +1888,7 @@ HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path,
             }
         }
     }
+    if (h.list_failed) { listing_free(&h); c->x[0] = R_HOST_FAILURE; return; }
     u64 v = new_handle(h);
     if (!v) { listing_free(&h); c->x[0] = R_TOO_MANY_HANDLES; return; }
     st64(c->x[0], v);
@@ -1518,11 +1917,13 @@ HLE(_ZN2nn2fs22GetDirectoryEntryCountEPlNS0_15DirectoryHandleE) {
 HLE(_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE) {
     Handle *h = get_handle(c->x[0]);
     if (!h) return;
+    int io = rb_close_barrier(c, h);
     listing_free(h);
     EnterCriticalSection(&lock);
     rb_closing(h);
     memset(h, 0, sizeof *h);
     LeaveCriticalSection(&lock);
+    if (io && kernel_rb_io_leave) kernel_rb_io_leave(io);
 }
 
 /* ---- what Skyline plugins ask of nn::fs that the game doesn't ----------------------- */

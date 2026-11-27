@@ -17,12 +17,23 @@ typedef struct TextureDesc {
     u32 block_height, block_depth;
     u32 bytes, bw, bh;            /* bytes per block, block width/height in texels */
     DXGI_FORMAT dxgi;
+    u32 astc;                     /* (not macOS) ASTC: the NVN format tex_decode_rgba8 decodes it as (0x79 + block size, 0x87 + for sRGB), else 0;
+                                     dxgi is then the RGBA8 the CPU decode produces, bytes/bw/bh still those of the blocks */
 } TextureDesc;
 
 /* Texture types in a header. */
 enum { TIC_1D, TIC_2D, TIC_3D, TIC_CUBE, TIC_1D_ARRAY, TIC_2D_ARRAY, TIC_1D_BUFFER, TIC_2D_NO_MIPMAP, TIC_CUBE_ARRAY };
 
 int tic_decode(const u32 *tic, TextureDesc *d);           /* 0 when the format is not supported */
+/* A B5G6R5 render target (format 0xE8) read through a B5G6R5 header (0x15): the game's selectors
+ * (stadium screens: out = B,G,R) assume the hardware's bit order for that pair, which the host
+ * surfaces do not have, so red and blue swap. Exchange the R and B sources (2 <-> 4). */
+static inline int rt565_read_swaps(u32 rt_format, u32 tic_format) { return rt_format == 0xE8 && tic_format == 0x15; }
+static inline u32 swz_swap_rb(u32 sw) {
+    u32 out = sw & ~0xFFFu;
+    for (int i = 0; i < 4; i++) { u32 c = (sw >> (3 * i)) & 7; out |= (c == 2 ? 4u : c == 4 ? 2u : c) << (3 * i); }
+    return out;
+}
 u64 texture_layer_size(const TextureDesc *d);
 void texture_read(const TextureDesc *d, u64 guest, u32 layer, u32 level, u8 *out);
 u64 texture_3d_size(const TextureDesc *d);                /* level 0 of a 3D texture, every slice */

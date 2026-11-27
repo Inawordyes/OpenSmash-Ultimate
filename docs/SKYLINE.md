@@ -7,13 +7,13 @@ GameBanana's moveset mods and new characters for Super Smash Bros. Ultimate are 
 download:
 
 - **files** for ARCropolis (models, animations, effects, sounds, UI, `config.json` for new costume
-  slots), which WindowSmash already installs (`tools/mods.py`, the Mods app), and
+  slots), which OpenSmash already installs (`tools/mods.py`, the Mods app), and
 - **code**: a Skyline plugin, `plugin.nro`, Switch arm64 code built with skyline-rs. It replaces the
   fighter's scripts through **Smashline 2** and often uses **lib_paramconfig** (fighter params),
   and, for new characters, the **CSK Collection** (new character-select entries) and ARCropolis'
   API.
 
-WindowSmash already recompiles the game's own NROs (the `lua2cpp_*` fighter modules) to C ahead
+OpenSmash already recompiles the game's own NROs (the `lua2cpp_*` fighter modules) to C ahead
 of time and loads them natively (`tools/recomp.py`, `runtime/hle_ro.c`). A plugin is the same
 kind of file, so the plan is: recompile each plugin the same way, and provide what Skyline,
 Smashline and the other dependency plugins provide on the console natively in the runtime.
@@ -83,7 +83,7 @@ The dependency plugins themselves (latest releases):
 | --- | --- | --- |
 | Smashline 2 v2.0.0 (was 1.6.8) | Skyline 5 (incl. `A64InlineHook`), main 11, lua2cpp_common 12, SDK 59 | hooks the game's agent factories (main+0x64c310 ...), lua2cpp_common's coroutine call and status lines with **inline** hooks at single instructions |
 | lib_paramconfig 6.5 | Skyline 3, ARCropolis 2, main 20 | on console: hooks param getters; reads `config_param.toml`. Here: the `.nro` is not run (its main hangs); `tools/paramconfig.py` + `runtime/hle_paramconfig.c` apply each enabled mod's toml natively. Movesets that link paramconfig into their own `plugin.nro` still work. |
-| CSK Collection 5.0.6 | Skyline 5 (incl. `A64InlineHook`), ARCropolis 6 (`arcrop_register_callback`: rewrites files as the game loads them) | patches `ui_chara_db` and friends at load time |
+| CSK Collection 6.0.1 | Skyline 5 (incl. `A64InlineHook`), ARCropolis 6 (`arcrop_register_callback`: rewrites files as the game loads them) | patches `ui_chara_db` and friends at load time |
 
 Smashline 2.0 changed `smashline_clone_weapon`, `smashline_update_weapon_count` and
 `smashline_whitelist_kirby_copy_article` (a clone is a new weapon kind; counts and the Kirby
@@ -95,7 +95,7 @@ that compares its clone's weapon kind with the original's (the clone has a new k
 original owner a 1.6 `clone_weapon` names, when it isn't the article's own (2.0 takes the
 article's); a 1.6 `update_weapon_count` reaches clones the 1.6 plugins made, not 2.0 plugins'.
 
-## How plugins run in WindowSmash (prototype)
+## How plugins run in OpenSmash (prototype)
 
 1. **Recompile the plugin** like a game NRO: copy `plugin.nro` into `dump/nro/`
    (`recomp.py` names and places it, `bases.txt`), then `recomp.py image` and `recomp.py build`
@@ -218,9 +218,11 @@ they are on the hookable list (`NATIVE_HOOKS` in skyline.py). A character a mod 
 same way: `mods.py apply` lists such characters in `dump/skyline/prcxml_redirects.txt` and the runtime
 adds them when the plugins load.
 
-The CSK Collection itself (5.0.6) is built for game 13.0.4: in 13.0.5 the code from about
+The CSK Collection itself was built for game 13.0.4 up to 5.0.6: in 13.0.5 the code from about
 main+0x1788000 up moved by 0x5B0 (Smashline's `+ 0x5B0` offsets), and most of its work is code
-patches and inline hooks - it can't run as a plugin here, hence the native version.
+patches and inline hooks - it could not run as a plugin here, hence the native version. 6.0.1 is
+built for 13.0.5 but for one inline hook left at its 13.0.4 address, which `tools/port_plugin.py`
+moves when the plugin is fetched (`tools/ports/the_csk_collection-6.0.1.txt`).
 
 ARCropolis' API: event callbacks (run once the plugins' mains have: Shadow registers its entries
 from one), `arcrop_is_mod_enabled`, versions. `mods:/` (ARCropolis' view of all turned-on mods'

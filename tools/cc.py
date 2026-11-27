@@ -195,7 +195,7 @@ def compile_command(src, obj, opt, flags=None, header=None):
 
 
 def compile_each(jobs_list, jobs=16, started=None, finished=None, log=print, compiled=None, flags=None, shown=None,
-                 infos=None, steps=None, times=None):
+                 infos=None, steps=None, times=None, failed=None, skip=None):
     """Compile (src, obj, opt) triples in parallel, in order, with flags (CFLAGS unless given); returns
     [(src, error text)] for failures. started(job) and finished(job, seconds), if given, are called
     (from the worker threads) as each one starts and ends (shown: a progress.Build, which also hears
@@ -203,10 +203,24 @@ def compile_each(jobs_list, jobs=16, started=None, finished=None, log=print, com
     it compiled at. A file the compiler crashed on is compiled again once the others are done, on its
     own (RETRY); log() says so. infos {obj: ladder.Info}: the generated files, which have a time limit
     and the rest of the ladder (steps: the build's ladder.Ladder, else one of its own); times: the
-    build folder's ladder.Times."""
+    build folder's ladder.Times. failed(job) and skip(job): ladder.Ladder.compile's."""
     steps = steps or ladder.Ladder(progress.level_cost, "clang-cl", log)
     return steps.compile(jobs_list, jobs, lambda job, level, header: compile_command(job[0], job[1], level, flags, header),
-                         infos, shown, started, finished, compiled, times)
+                         infos, shown, started, finished, compiled, times, failed, skip)
+
+
+def link_map(out):
+    """The linker's option for the program's map (build/ssbu.map, 0.8 GB: only runtime/debug_profile.c's profiler
+    reads it, for names). SSBU_LINK_MAP=0: none written, and one left by an earlier link removed (it would name
+    another program's addresses)."""
+    path = out[:-4] + ".map"
+    if os.environ.get("SSBU_LINK_MAP", "1").strip() != "0":
+        return ["/MAP:" + path]
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return []
 
 
 def link_command(rsp, exe, options=(), libs=()):
@@ -284,7 +298,7 @@ def link(objs, exe, options=()):
         with open(rsp, "w") as f:
             f.write("\n".join(f'"{o}"' for o in inputs))
         r = subprocess.run(link_command(rsp, exe, ["/HIGHENTROPYVA:NO", "/MANIFEST:NO", "/OPT:REF", "/OPT:NOICF",
-                                                   "/MAP:" + exe[:-4] + ".map", *options], EXTRA_LIBS),
+                                                   *link_map(exe), *options], EXTRA_LIBS),
                            capture_output=True, text=True)
         if not r.returncode:
             break
@@ -304,7 +318,7 @@ def library_command(rsp, dll):
     the runtime calls (the game's C reaches the runtime through the tables the library hands it). Placed as
     the program is (/HIGHENTROPYVA:NO); its one export is the function that hands over those tables."""
     return [CLANG, "/nologo", "/LD", *LINK_FLAGS, "@" + rsp, "/Fe" + dll, "/link", *LINK_OPTIONS, "/HIGHENTROPYVA:NO",
-            "/MAP:" + dll[:-4] + ".map"]
+            *link_map(dll)]
 
 
 def link_library(objs, dll):

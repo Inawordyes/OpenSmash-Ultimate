@@ -1,4 +1,4 @@
-"""The installer's decisions (tools/install_windowsmash.ps1): its pure functions, run in Windows
+"""The installer's decisions (tools/install_opensmash.ps1): its pure functions, run in Windows
 PowerShell with made-up inputs. No downloads, no installs, no game files."""
 from pathlib import Path
 import json
@@ -11,7 +11,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 PS = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
-SCRIPT = ROOT / 'tools/install_windowsmash.ps1'
+SCRIPT = ROOT / 'tools/install_opensmash.ps1'
 
 
 def ps_text(script):
@@ -227,7 +227,8 @@ class InstallerDecisionTests(unittest.TestCase):
             out = ps_text(run + "$global:prep = 0; "
                           "$r = Step-Build @{ Game = 'D:\\Game'; Keys = 'D:\\Keys'; Firmware = '' }; "
                           "'RESULT: ' + $r; 'CALLS: ' + ($global:calls -join '|')")
-            self.assertIn('build_game.py --game D:\\Game --keys D:\\Keys --no-firmware --prepare-only', out)
+            # (--std-plugins: the standard plugins are listed before the build, SSBU_PLUGINS_FIRST)
+            self.assertIn('build_game.py --game D:\\Game --keys D:\\Keys --no-firmware --std-plugins --prepare-only', out)
             self.assertIn('RESULT: True', out)
             self.assertNotIn('run OpenSmash.exe again', out)
 
@@ -283,6 +284,28 @@ class InstallerDecisionTests(unittest.TestCase):
                           "function Invoke-Python { return 0 }; "
                           "Step-Build @{ Game = 'D:\\Game'; Keys = 'D:\\Keys'; Firmware = '' } | Out-Null")
         self.assertIn('nothing that goes into the game changed: no build', out)
+
+    def test_a_release_build_without_its_game_library_is_built_again(self):
+        # (a release's install builds the game as build\ssbu_game.dll beside the program, --game-dll: a program left
+        # without its library, by a build whose library link failed, does not start - "carry on" must build it again,
+        # not say nothing changed)
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, 'build'))
+            Path(tmp, 'build', 'ssbu.exe').write_bytes(b'the runtime alone')
+            run = (f"$Root = '{tmp}'; $DryRun = $false; $Rebuild = $false; $SkipBuild = $false; "
+                   "$env:OPENSMASH_RELEASE_TAG = 'v9.9.9'; $global:calls = [Collections.Generic.List[string]]::new(); "
+                   "function Invoke-Python { param($Arguments) $a = @($Arguments); $a[0] = Split-Path $a[0] -Leaf; "
+                   "$global:calls.Add($a -join ' '); if ($a[0] -eq 'build_game.py') { throw 'BUILT' }; return 0 }; "
+                   "try { Step-Build @{ Game = 'D:\\Game'; Keys = 'D:\\Keys'; Firmware = '' } | Out-Null } catch { }; "
+                   "'CALLS: ' + ($global:calls -join '|')")
+            out = ps_text(run)
+            self.assertNotIn('nothing that goes into the game changed', out)
+            self.assertIn('build_game.py --game D:\\Game --keys D:\\Keys --no-firmware --std-plugins --game-dll', out)
+            Path(tmp, 'build', 'ssbu_game.dll').write_bytes(b'the game')   # (with its library: current, as before)
+            out = ps_text(run)
+            self.assertIn('nothing that goes into the game changed: no build', out)
+            builds = [c for c in out.split('CALLS: ')[-1].strip().split('|') if c.startswith('build_game.py')]
+            self.assertTrue(builds and all(c.endswith('--prepare-only') for c in builds), out)   # (the DLC read only)
 
     def test_build_forgets_stale_prepared_shaders(self):
         # (built, or nothing to build: tools\shader_aot.py --forget-stale asks for Prepare Shaders again when the
@@ -526,6 +549,183 @@ class InstallerDecisionTests(unittest.TestCase):
         self.assertIn('tools/source_version.txt export-subst', attributes.splitlines())
         self.assertIn('$Format:%H', (ROOT / 'tools/source_version.txt').read_text())
 
+    def test_foreign_commit(self):
+        shared = '8025b483b0443adb5668395eca31f9250e8c8efb'
+        other = '9fdc8fd21b3fde86c3e58a1e634a7e76a87220c7'
+        got = ps("@{ ws = (Resolve-ForeignCommit '598d05240fc146f7184b3450653e2eec2ee97312'); "
+                 "upper = (Resolve-ForeignCommit '3D5BA9095BF4A2C0D146DF31ADEC0D59B8337BBB'); "
+                 f"other = (Resolve-ForeignCommit '{other}') }}")
+        self.assertEqual(got, {'ws': shared, 'upper': shared, 'other': other})
+
+    def test_published_sha256(self):
+        h = '100e41cb62feabba16563990abbea1e1112def73a8098fa604b9b3369165c218'
+        got = ps(f"@{{ a = (Read-PublishedSha256 '{h.upper()}  OpenSmash.exe'); b = (Read-PublishedSha256 '{h}'); "
+                 f"c = (Read-PublishedSha256 'Not Found'); d = (Read-PublishedSha256 '{h}0  x') }}")
+        self.assertEqual(got, {'a': h, 'b': h, 'c': None, 'd': None})
+
+    def test_launcher_exe_refresh(self):
+        # An OpenSmash.exe that is not the latest release's is swapped for it (the old one kept as .old); the release's
+        # own, a copy following main, and a git checkout are left alone. Downloads are made up.
+        new = b'MZ new launcher'
+        new_hash = __import__('hashlib').sha256(new).hexdigest()
+        with tempfile.TemporaryDirectory() as root:
+            def run(ref, exe, git=False, text=None, download=b'MZ new launcher', old_left=None, rebuilds=False):
+                for name in ('OpenSmash.exe', 'OpenSmash.exe.old', 'OpenSmash.exe.download'):
+                    if os.path.exists(os.path.join(root, name)):
+                        os.remove(os.path.join(root, name))
+                if exe is not None:
+                    Path(root, 'OpenSmash.exe').write_bytes(exe)
+                if old_left is not None:
+                    Path(root, 'OpenSmash.exe.old').write_bytes(old_left)
+                if git:
+                    os.makedirs(os.path.join(root, '.git'), exist_ok=True)
+                elif os.path.isdir(os.path.join(root, '.git')):
+                    os.rmdir(os.path.join(root, '.git'))
+                body = text if text is not None else f"'{new_hash}  OpenSmash.exe'"
+                mocks = (f"$Root = '{root}'; $Script:UpdateRef = '{ref}'; $env:OPENSMASH_LAUNCHER_REBUILDS = '{'1' if rebuilds else ''}'; "
+                         f"function Get-Text {{ param($Url) $Url | Out-File -Append -LiteralPath (Join-Path $Root 'urls.txt'); {body} }}; "
+                         f"function Invoke-Download {{ param($Url, $Dest, $What) [IO.File]::WriteAllText($Dest, '{download.decode()}') }}; ")
+                out = ps_text(mocks + "'swapped=' + (Update-LauncherExe)")
+                exe_path = Path(root, 'OpenSmash.exe')
+                self.assertFalse(os.path.exists(os.path.join(root, 'OpenSmash.exe.download')), out)   # never left behind
+                return (out, exe_path.read_bytes() if exe_path.exists() else None,
+                        os.path.exists(os.path.join(root, 'OpenSmash.exe.old')))
+            out, exe, old = run('v0.5.0', b'MZ old launcher')
+            self.assertIn('swapped=True', out)
+            self.assertIn("OpenSmash.exe is now v0.5.0's", out)
+            self.assertEqual(exe, new)
+            self.assertTrue(old)
+            self.assertIn('/releases/download/v0.5.0/OpenSmash.exe.sha256', Path(root, 'urls.txt').read_text('utf-16'))
+            out, exe, old = run('v0.5.0', new)
+            self.assertIn('swapped=False', out)
+            self.assertIn("OpenSmash.exe is v0.5.0's", out)
+            # following main: main's build, the prerelease launcher-main (.github/workflows/launcher-main.yml), so a copy
+            # on main without the .NET SDK does not keep a launcher that cannot sign in (#510)
+            Path(root, 'urls.txt').unlink()
+            out, exe, old = run('main', b'MZ old launcher')
+            self.assertIn('swapped=True', out)
+            self.assertIn("OpenSmash.exe is now main's", out)
+            self.assertEqual((exe, old), (new, True))
+            self.assertIn('/releases/download/launcher-main/OpenSmash.exe.sha256', Path(root, 'urls.txt').read_text('utf-16'))
+            out, exe, _ = run('main', new)
+            self.assertIn('swapped=False', out)
+            self.assertIn("OpenSmash.exe is main's", out)
+            out, exe, _ = run('main', b'MZ old launcher', download=b'MZ tampered')
+            self.assertIn('swapped=False', out)
+            self.assertEqual(exe, b'MZ old launcher')
+            out, exe, _ = run('main', b'MZ old launcher', rebuilds=True)   # a launcher with the SDK rebuilds its own
+            self.assertIn('swapped=False', out)
+            self.assertEqual(exe, b'MZ old launcher')
+            out, exe, _ = run('v0.5.0', b'MZ old launcher', git=True)
+            self.assertIn('swapped=False', out)
+            self.assertEqual(exe, b'MZ old launcher')
+            out, exe, _ = run('v0.5.0', b'MZ old launcher', rebuilds=True)   # the new launcher rebuilds it itself
+            self.assertIn('swapped=False', out)
+            self.assertEqual(exe, b'MZ old launcher')
+            # a download that is not what the checksum says, no network, no checksum: the old one stays, untouched
+            for kwargs in ({'download': b'MZ tampered'}, {'text': "throw 'no network'"}, {'text': "'Not Found'"}):
+                out, exe, old = run('v0.5.0', b'MZ old launcher', **kwargs)
+                self.assertIn('swapped=False', out, kwargs)
+                self.assertEqual(exe, b'MZ old launcher', kwargs)
+                self.assertFalse(old, kwargs)
+            # last time's swap: the .old is removed; a swap that stopped half-way (no OpenSmash.exe) gets it back
+            out, exe, old = run('v0.5.0', new, old_left=b'MZ old launcher')
+            self.assertEqual((exe, old), (new, False))
+            out, exe, old = run('v0.5.0', None, old_left=b'MZ old launcher', text="throw 'no network'")
+            self.assertEqual((exe, old), (b'MZ old launcher', False))
+
+    def test_main_launcher_tag_is_the_workflows(self):
+        # The tag the installer downloads main's OpenSmash.exe from is the one the workflow publishes, as a prerelease
+        # that never takes "latest" (the stable channel's releases/latest), with the checksum beside the exe.
+        tag = re.search(r"^\$MainLauncherTag = '([^']+)'", SCRIPT.read_text(encoding='utf-8'), re.M).group(1)
+        flow = (ROOT / '.github/workflows/launcher-main.yml').read_text(encoding='utf-8')
+        self.assertIn(f"$tag = '{tag}'", flow)
+        self.assertIn('--prerelease --latest=false', flow)
+        self.assertIn('OpenSmash.exe OpenSmash.exe.sha256 --clobber', flow)
+        self.assertIn('branches: [main]', flow)
+        self.assertNotRegex(tag, r'^v\d|^launcher-v')   # (release.yml's v* and launcher-release.yml's launcher-v* tags)
+
+    def test_update_ref_never_main_by_mistake(self):
+        # The release channel: the API's tag; its 404 (no release) is main; the API failing (no network, its hourly limit)
+        # asks github.com's releases/latest page, and with no answer at all the ref is unknown ($null), never main: a
+        # release copy was compared with main and its finished update called unfinished (Discord, 2026-11-18).
+        def ref(api, page):
+            return ps(f"$env:OPENSMASH_UPDATE_CHANNEL = 'release'; $Root = [IO.Path]::GetTempPath(); "
+                      f"function Invoke-Api {{ param($Url) {api} }}; function Get-LatestReleaseFromPage {{ {page} }}; "
+                      "@{ ref = (Get-UpdateRef); why = $Script:UpdateRefProblem }")
+        ok = "@{ Ok = $true; Data = [pscustomobject]@{ tag_name = 'v0.4.1' } }"
+        limit = "@{ Ok = $false; NotFound = $false; Error = 'HTTP 403' }"
+        none = "@{ Ok = $false; NotFound = $true; Error = 'HTTP 404' }"
+        silent = "@{ Tag = $null; NoRelease = $false }"
+        self.assertEqual(ref(ok, "throw 'not asked'")['ref'], 'v0.4.1')
+        self.assertEqual(ref(none, "throw 'not asked'")['ref'], 'main')
+        self.assertEqual(ref(limit, "@{ Tag = 'v0.4.1'; NoRelease = $false }")['ref'], 'v0.4.1')
+        self.assertEqual(ref(limit, "@{ Tag = $null; NoRelease = $true }")['ref'], 'main')
+        self.assertEqual(ref(limit, silent), {'ref': None, 'why': 'HTTP 403'})
+        got = ps("@{ a = (Read-ReleaseTagFromUrl 'https://github.com/O/R/releases/tag/v0.4.1'); "
+                 "b = (Read-ReleaseTagFromUrl 'https://github.com/O/R/releases/tag/v1.0%2Bx'); "
+                 "c = (Read-ReleaseTagFromUrl 'https://github.com/O/R/releases'); d = (Read-ReleaseTagFromUrl '') }")
+        self.assertEqual(got, {'a': 'v0.4.1', 'b': 'v1.0+x', 'c': None, 'd': None})
+
+    def test_update_with_the_release_unknown(self):
+        # Step-Update with GitHub not saying which release is the latest: no update (to main or anything), a warning; and
+        # the launcher's proof line (__OPENSMASH_SOURCE__) when the copy is checked to be the release's.
+        with tempfile.TemporaryDirectory() as root:
+            local = 'a' * 40
+            Path(root, 'tools').mkdir()
+            Path(root, 'tools', 'source_version.txt').write_text(f'{local} 2026-11-17')
+            base = (f"$env:OPENSMASH_UPDATE_CHANNEL = 'release'; $Root = '{root}'; "
+                    "function Get-LatestReleaseFromPage { @{ Tag = $null; NoRelease = $false } }; "
+                    "function Update-FromZip { 'ZIP ' + $args[1] }; ")
+            out = ps_text(base + "function Invoke-Api { param($Url) $Url | Out-Host; @{ Ok = $false; NotFound = $false; Error = 'HTTP 403' } }; "
+                          "'result=' + (Step-Update)")
+            self.assertIn('result=False', out)
+            self.assertIn('which release is the latest (HTTP 403)', out)
+            self.assertNotIn('/commits/main', out)
+            self.assertNotIn('ZIP', out)
+            current = ("function Invoke-Api { param($Url) if ($Url -like '*/releases/latest') { @{ Ok = $true; Data = [pscustomobject]@{ tag_name = 'v0.4.1' } } } "
+                       f"else {{ @{{ Ok = $true; Data = [pscustomobject]@{{ sha = '{local}'; commit = [pscustomobject]@{{ committer = [pscustomobject]@{{ date = '2026-11-17T00:00:00Z' }} }} }} }} }} }}; ")
+            out = ps_text(base + current + "'result=' + (Step-Update)")
+            self.assertIn('result=False', out)
+            self.assertIn('__OPENSMASH_SOURCE__ ' + local, out)
+
+    def test_launcher_only_fallback(self):
+        # -LauncherOnly (a launcher rebuild that failed): the release's OpenSmash.exe, whatever OPENSMASH_LAUNCHER_REBUILDS
+        # says; $Script:LauncherIsRelease tells the helper whether OpenSmash.exe is the release's afterwards.
+        new = b'MZ new launcher'
+        new_hash = __import__('hashlib').sha256(new).hexdigest()
+        with tempfile.TemporaryDirectory() as root:
+            def run(ref, exe):
+                Path(root, 'OpenSmash.exe').write_bytes(exe)
+                for name in ('OpenSmash.exe.old',):
+                    if os.path.exists(os.path.join(root, name)):
+                        os.remove(os.path.join(root, name))
+                mocks = (f"$Root = '{root}'; $Script:UpdateRef = {ref}; $env:OPENSMASH_LAUNCHER_REBUILDS = ''; "
+                         "function Get-LatestReleaseFromPage { @{ Tag = $null; NoRelease = $false } }; "
+                         "function Invoke-Api { @{ Ok = $false; NotFound = $false; Error = 'HTTP 403' } }; "
+                         f"function Get-Text {{ '{new_hash}  OpenSmash.exe' }}; "
+                         f"function Invoke-Download {{ param($Url, $Dest, $What) [IO.File]::WriteAllText($Dest, '{new.decode()}') }}; ")
+                return ps_text(mocks + "[void](Update-LauncherExe); 'release=' + $Script:LauncherIsRelease")
+            self.assertIn('release=True', run("'v0.4.1'", b'MZ old launcher'))   # swapped
+            self.assertIn('release=True', run("'v0.4.1'", new))                  # already the release's
+            self.assertIn('release=True', run("'main'", b'MZ old launcher'))     # following main: main's build
+            out = run('$null', b'MZ old launcher')                                 # GitHub not saying: nothing done
+            self.assertIn('release=False', out)
+            self.assertEqual(Path(root, 'OpenSmash.exe').read_bytes(), b'MZ old launcher')
+        text = SCRIPT.read_text(encoding='utf-8')
+        self.assertRegex(text, r"if \(\$LauncherOnly\) \{[^}]*OPENSMASH_LAUNCHER_REBUILDS = ''")
+        for helper in ('tools/rebuild_launcher_after_update.ps1', 'tools/rebuild-all.ps1'):
+            self.assertIn('-LauncherOnly', (ROOT / helper).read_text(encoding='utf-8'), helper)
+
+    def test_sha256(self):
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, 'f').write_bytes(b'abc')
+            want = __import__('hashlib').sha256(b'abc').hexdigest()
+            f = os.path.join(root, 'f')
+            got = ps(f"@{{ h = (Get-Sha256 '{f}'); ok = (Test-FileSha256 '{f}' '{want.upper()}'); "
+                     f"bad = (Test-FileSha256 '{f}' '{'0' * 64}') }}")
+            self.assertEqual(got, {'h': want, 'ok': True, 'bad': False})
+
     def test_update_decision(self):
         got = ps("@{ a = (Get-UpdateDecision 'ahead'); i = (Get-UpdateDecision 'identical'); b = (Get-UpdateDecision 'behind'); "
                  "d = (Get-UpdateDecision 'diverged'); x = (Get-UpdateDecision 'something') }")
@@ -670,13 +870,13 @@ class InstallerDecisionTests(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)             # 3.14: compression.zstd
 
     def test_small_decisions(self):
-        got = ps("@{ fw = (Get-FirewallRuleCommand 'C:\\WindowSmash\\build\\ssbu.exe' 'WindowSmash (ssbu.exe)'); "
+        got = ps("@{ fw = (Get-FirewallRuleCommand 'C:\\OpenSmash\\build\\ssbu.exe' 'WindowSmash (ssbu.exe)'); "
                  "v1 = (Test-PythonVersionText 'Python 3.14.6'); v2 = (Test-PythonVersionText '3.10.0'); "
                  "v3 = (Test-PythonVersionText '3.9.13'); v4 = (Test-PythonVersionText 'Python was not found'); "
                  "v5 = (Test-PythonVersionText '2.7.18'); "
                  "d1 = (Get-DiskNeedGb 60 25); d2 = (Get-DiskNeedGb 60 70) }")
         self.assertIn('New-NetFirewallRule', got['fw'])
-        self.assertIn("-Program 'C:\\WindowSmash\\build\\ssbu.exe'", got['fw'])
+        self.assertIn("-Program 'C:\\OpenSmash\\build\\ssbu.exe'", got['fw'])
         self.assertIn("-DisplayName 'WindowSmash (ssbu.exe)'", got['fw'])
         self.assertIn('-Direction Inbound', got['fw'])
         self.assertEqual([got['v1'], got['v2'], got['v3'], got['v4'], got['v5']], [True, True, False, False, False])
